@@ -1,0 +1,11 @@
+name: sgl_analytic
+channels: [conda-forge]
+dependencies:
+  - python=3.12
+  - numpy=2.4.3
+  - scipy=1.17.1
+  - numba=0.65.1
+  - matplotlib
+  - ipykernel
+  - nbformat
+  - nbclient
