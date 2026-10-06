@@ -73,8 +73,8 @@ while not (REPO / "src" / "pipeline.py").is_file():
 # Source redshifts: one PDF per z_s per cosmology.
 ZS = [0.5, 1.0, 3.0, 10.0]
 
-# Cosmologies to compare, name -> parameters. Allowed keys: h, Om, s8, Ob, ns.
-# Omitted keys take Planck 2018: h=0.674, Om=0.315, s8=0.811, Ob=0.0493, ns=0.965.
+# Cosmologies to compare, name -> parameters. Allowed keys: h, Om, sigma8 (or s8), Ob, ns, zeq.
+# Omitted keys take Planck 2018: h=0.674, Om=0.315, s8=0.811, Ob=0.0493, ns=0.965, zeq=3402.0.
 # s8 is a real-space top-hat sigma_8. The FIRST entry is the reference of the ratio plots.
 COSMOLOGIES = {
     "Planck 2018":   dict(),
@@ -147,7 +147,7 @@ print(f"{len(R)} PDFs ready in {time.time() - t0:.0f} s")"""))
     c.append(md(r"""## Summary table
 
 All moments are of $\ln\mu$ in the source plane:
-- *full*: over the whole computed support;
+- *full*: over the solver moment interval (`grid.xi_min` to `grid.xi_max`), which varies with redshift;
 - *clipped*: over $|\ln\mu|\le1$, renormalised there, which is robust to the far tail.
 
 $\bar\kappa$ is the mean convergence of the modelled lenses, which the distortions are measured from."""))
@@ -313,7 +313,7 @@ else:
                    results=[{"cosmology": k[0], "z_s": k[1],
                              **{c_: (float(v) if np.ndim(v) == 0 else v) for c_, v in row.items()}}
                             for k, row in table.to_dict("index").items()],
-                   cosmology_resolved={name: {p: R[(name, ZS[0])][p] for p in ("h", "Om", "s8", "Ob", "ns")}
+                   cosmology_resolved={name: {p: R[(name, ZS[0])][p] for p in ("h", "Om", "sigma8", "Ob", "ns", "zeq")}
                                        for name in COSMOLOGIES})
     (SAVE_DIR / "summary.json").write_text(json.dumps(summary, indent=1))
     print(f"wrote {len(files)} CSV files + summary.json to {SAVE_DIR}")"""))

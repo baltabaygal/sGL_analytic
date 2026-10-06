@@ -11,8 +11,8 @@ import os
 # Source redshift of the stage-by-stage walkthrough (one full PDF, ~10-20 s).
 ZS = 1.0
 
-# Cosmology (h, Omega_m, sigma_8).  Omega_b = 0.0493, n_s = 0.965 and the CMB
-# temperature are held at the sgl.DEFAULTS values; sigma_8 is a real-space
+# Cosmology (h, Omega_m, sigma_8, Omega_b, n_s, z_eq). The CMB temperature
+# is held at the sgl.DEFAULTS value; sigma_8 is a real-space
 # top-hat sigma_8 (the engine's anchor).  Changing sigma_8 moves sigma(M), the
 # mass function, the Ludlow+16 concentrations and the linear P(k) together.
 COSMO = dict(h=0.674, Om=0.315, s8=0.811, Ob=0.0493, ns=0.965, zeq=3402.0)
