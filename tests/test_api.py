@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 
 from sgl_analytic import generate_pdf, generate_pdf_lnmu
-from sgl_analytic.pipeline import make_cosmology, on
+from sgl_analytic.pipeline import make_cosmology, on, run
 
 
 class PublicAPI(unittest.TestCase):
@@ -28,6 +28,23 @@ class PublicAPI(unittest.TestCase):
                    dict(zeq=-1), dict(sigma8=.8, s8=.8)):
             with self.subTest(cp=cp), self.assertRaises(ValueError):
                 make_cosmology(cp)
+
+    def test_cosmology_reaches_engine(self):
+        with patch("sgl_analytic.pipeline.sgl.Cosmology") as engine:
+            make_cosmology(dict(h=.7, Om=.3, sigma8=.9, Ob=.05, ns=.97, zeq=3450))
+        engine.assert_called_once_with(window="smoothk", transfer="eh98", anchor="tophat",
+                                       conc_model=16, h=.7, Om=.3, s8=.9,
+                                       Ob=.05, ns=.97, zeq=3450)
+
+    def test_invalid_redshift_and_workers_fail_before_build(self):
+        with patch("sgl_analytic.pipeline.make_cosmology") as cosmology:
+            for zs in (0, -1, np.nan, np.inf):
+                with self.subTest(zs=zs), self.assertRaises(ValueError):
+                    run(zs, "full")
+            for nproc in (0, -1, 1.5, True):
+                with self.subTest(nproc=nproc), self.assertRaises(ValueError):
+                    run(1, "full", nproc=nproc)
+            cosmology.assert_not_called()
 
     def test_parameter_forwarding_and_jacobian(self):
         def fake_run(zs, cfg, **kw):
