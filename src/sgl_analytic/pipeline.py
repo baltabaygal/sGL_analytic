@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Semi-analytic magnification PDF of the default lens model.
 
-`run(zs, "full", cosmo=dict(h=, Om=, s8=))` returns (out, meta): `out["xi"]`,
+`run(zs, "full", cosmo=dict(h=, Om=, s8=, Ok=, w0=, wa=))` returns (out, meta): `out["xi"]`,
 `out["P_s"]` = source-plane dP/d ln mu on ln mu in [-1, 1], `out["xi_tail"]`,
 `out["P_s_tail"]` on ln mu in (1, 9], plus moments, sigma_kappa and stage timings.
 Config strings: "full" (default), "halo", "+ell", "+fil", "+sub", "+bias", "-<x>".
@@ -14,6 +14,7 @@ import os
 import json
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -22,29 +23,51 @@ from . import sgl
 from . import sgl_full as F
 
 P = dict(h=0.674, Om=0.315, s8=0.811, Ob=0.0493, ns=0.965, zeq=3402.0)
+# Curvature and CPL dark energy (2026-10-06). Kept out of P on purpose: P is
+# the Planck LCDM reference that config.COSMO and the stored PDFs refer to.
+#   Ok: Omega_K (> 0 open, < 0 closed); Omega_DE = 1 - Om - Ok.
+#   w0, wa: w(a) = w0 + wa (1 - a); (-1, 0) is a cosmological constant.
+#   growth_mode: "auto" = the historical LCDM growth for any Lambda model
+#     (exact integral for sigma(M), Carroll-Press-Turner in bias and M*) and
+#     the GR growth ODE otherwise; "ode" = the ODE for every model, including
+#     Lambda. "auto" therefore jumps at w = -1 (1.9e-4 in the z_s = 1 clipped
+#     variance): compare a w model with an "ode" Lambda run.
+EXTENSIONS = dict(Ok=0.0, w0=-1.0, wa=0.0, growth_mode="auto")
 
 
 def make_cosmology(cosmo=None):
     """The chain's Cosmology: EH98 transfer, smooth-k sigma(M) window, top-hat
     sigma_8 anchor, Ludlow+16 concentrations.  `cosmo` may set h, Om, s8 (P
-    otherwise), Ob, ns and zeq. sigma8 is accepted as an alias for s8."""
+    otherwise), Ob, ns, zeq and the EXTENSIONS Ok, w0, wa, growth_mode.
+    sigma8 is accepted as an alias for s8."""
     supplied = dict(cosmo or {})
     if "sigma8" in supplied:
         if "s8" in supplied:
             raise ValueError("supply sigma8 or s8, not both")
         supplied["s8"] = supplied.pop("sigma8")
-    cp = {**P, **supplied}
-    bad = set(cp) - {"h", "Om", "s8", "Ob", "ns", "zeq"}
+    cp = {**P, **EXTENSIONS, **supplied}
+    bad = set(cp) - set(P) - set(EXTENSIONS)
     if bad:
         raise ValueError(f"unknown cosmology parameter(s) {sorted(bad)}")
-    for key, value in cp.items():
+    for key in P:
+        value = cp[key]
         if not np.isscalar(value) or not np.isfinite(value) or value <= 0:
             raise ValueError(f"{key} must be a finite positive number")
+    for key in ("Ok", "w0", "wa"):
+        value = cp[key]
+        if isinstance(value, bool) or not np.isscalar(value) or not np.isfinite(value):
+            raise ValueError(f"{key} must be a finite number")
+    if cp["growth_mode"] not in ("auto", "ode", "legacy"):
+        raise ValueError("growth_mode must be 'auto', 'ode' or 'legacy'")
     if not 0 < cp["Ob"] < cp["Om"] <= 1:
-        raise ValueError("require 0 < Ob < Om <= 1 for the flat LCDM model")
+        raise ValueError("require 0 < Ob < Om <= 1")
+    # sgl.Cosmology enforces the remaining domain: -2 <= w0 < -0.3, w0 + wa <
+    # -0.3 with negligible early dark energy, E(z)^2 > 0, legacy only for Lambda
     return sgl.Cosmology(window="smoothk", transfer="eh98", anchor="tophat",
                          conc_model=16, h=cp["h"], Om=cp["Om"], s8=cp["s8"],
-                         Ob=cp["Ob"], ns=cp["ns"], zeq=cp["zeq"])
+                         Ob=cp["Ob"], ns=cp["ns"], zeq=cp["zeq"],
+                         Ok=cp["Ok"], w0=cp["w0"], wa=cp["wa"],
+                         growth_mode=cp["growth_mode"])
 
 
 INGREDIENTS = ("ell", "fil", "sub", "bias")
@@ -123,6 +146,10 @@ def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
         raise ValueError("edge must be 'rvir' or 'kthr'")
     s = on(cfg)
     cos = make_cosmology(cosmo)
+    if (cosmo or {}).get("growth_mode", "auto") == "auto" and cos.growth_mode == "ode":
+        warnings.warn("growth_mode='auto' resolved to 'ode' for non-Lambda dark energy, "
+                      "while Lambda runs (and the stored references) use the historical "
+                      "growth; compare against a growth_mode='ode' Lambda run.", stacklevel=2)
     t0 = time.time()
     # defaults (2026-10-02) = the CLI defaults: exact moment sector, clumps
     # truncated at their r_vir; explicit sub_kw entries override them
@@ -183,7 +210,8 @@ def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
     out = dict(t_stages=dict(build=t_build - t0, lam=t_lam - t_build, invert=t_inv - t_lam),zs=zs, cfg=cfg_name(cfg),
                zint=zint, zint_n=(zint_n if zint == "gauss" else None), clustering=clustering,
                xi_kperp=({k: xi[k] for k in ("kmin", "kmax", "per_decade", "mmax")} if xi else None), edge=edge, lss_var=lss_var,
-               kap_floor=(kap_floor if edge != "kthr" else None), kbar=info["kbar"], h=cos.h, Om=cos.Om, s8=cos.s8, Ob=cos.Ob, ns=cos.ns, zeq=cos.zeq, sigma8=cos.s8, nord=nord, grid_scale=grid_scale, split=split,
+               kap_floor=(kap_floor if edge != "kthr" else None), kbar=info["kbar"], h=cos.h, Om=cos.Om, s8=cos.s8, Ob=cos.Ob, ns=cos.ns, zeq=cos.zeq, sigma8=cos.s8,
+               Ok=cos.Ok, w0=cos.w0, wa=cos.wa, growth_mode=cos.growth_mode, nord=nord, grid_scale=grid_scale, split=split,
                nproc=nproc, sub_kw=(sub._init_kw if sub is not None else None),
                pair_angle=(sub.pair_angle if sub is not None else None),
                k3=lam.k3, exactS=bool(lam.exactS), s_taper=lam.s_taper,

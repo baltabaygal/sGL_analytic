@@ -11,7 +11,9 @@ import os
 # Source redshift of the stage-by-stage walkthrough (one full PDF, ~10-20 s).
 ZS = 1.0
 
-# Cosmology (h, Omega_m, sigma_8, Omega_b, n_s, z_eq). The CMB temperature
+# Cosmology (h, Omega_m, sigma_8, Omega_b, n_s, z_eq); pipeline.make_cosmology also
+# accepts Ok (curvature), w0, wa (CPL dark energy) and growth_mode, default flat LCDM.
+# The stored-reference comparison runs only while COSMO == pipeline.P. The CMB temperature
 # is held at the sgl.DEFAULTS value; sigma_8 is a real-space
 # top-hat sigma_8 (the engine's anchor).  Changing sigma_8 moves sigma(M), the
 # mass function, the Ludlow+16 concentrations and the linear P(k) together.

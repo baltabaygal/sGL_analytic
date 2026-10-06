@@ -300,10 +300,17 @@ def z_shells(zs, zint="engine", zint_n=2):
 
 def Dg(cos, z):
     """Carroll-Press-Turner growth, Dg(0)=1 (cosmology.h:90-102) -- the engine
-    uses THIS (not the exact integral) in delta_c(z), the bias and M*(z)."""
+    uses THIS (not the exact integral) in delta_c(z), the bias and M*(z).
+    growth_mode="ode" returns the exact cos.D instead, so "auto" (CPT for
+    Lambda, ODE for any w != -1) jumps at w = -1: 1.9e-4 in the z_s=1 clipped
+    variance (2026-10-06 audit). Compare w models to an "ode" Lambda run."""
+    if getattr(cos, "growth_mode", "legacy") == "ode":
+        return cos.D(z)
     def nn(zz):
         a3 = cos.Om * (1 + zz)**3
         E2 = a3 + cos.OL
+        if getattr(cos, "Ok", 0.0) != 0.0:
+            E2 += cos.Ok * (1 + zz)**2
         Omz, OLz = a3 / E2, cos.OL / E2
         return 2.5 * Omz / (Omz**(4 / 7) - OLz + (1 + Omz / 2) * (1 + OLz / 70)) / (1 + zz)
     return nn(z) / nn(0.0)
@@ -2089,7 +2096,9 @@ def kappa_threshold(cos, zs, N=NHALOS):
 # ================================================== correlated bias field ===
 def P0(cos, k):
     """Growth-free linear P(k) [Mpc^3], same normalisation as cos.sigmaR."""
-    return cos._Anorm**2 * k**cos.ns * cos.T(k)**2
+    if getattr(cos, "pk_mod", None) is None:
+        return cos._Anorm**2 * k**cos.ns * cos.T(k)**2
+    return cos._Anorm**2 * cos.Pshape(k)
 
 
 # xi_lin two-point term (2026-10-05): SVD rows kept above this x the largest
@@ -2217,12 +2226,18 @@ def limber_lss_var(cos, zs, lmin=1.0, lmax=1e7, nchi=600):
     chi = np.linspace(chis * 1e-4, chis * (1 - 1e-4), nchi)
     z = np.interp(chi, ct, zt)
     H0 = 100.0 * cos.h / CKMS
-    W = 1.5 * cos.Om * H0**2 * (1 + z) * chi * (chis - chi) / chis
+    if getattr(cos, "Ok", 0.0) == 0.0:
+        transverse = chi
+        W = 1.5 * cos.Om * H0**2 * (1 + z) * chi * (chis - chi) / chis
+    else:
+        transverse = cos.f_K(chi)
+        W = (1.5 * cos.Om * H0**2 * (1 + z) * transverse
+             * cos.f_K(chis - chi) / cos.f_K(chis))
     D = np.array([Dg(cos, zz) for zz in z])
     Kg = np.geomspace(1e-7, 1e5, 40000)
     f = Kg * P0(cos, Kg) / (2 * pi)
     cum = np.concatenate([[0.0], np.cumsum(0.5 * (f[1:] + f[:-1]) * np.diff(Kg))])
-    I = np.interp(lmax / chi, Kg, cum) - np.interp(lmin / chi, Kg, cum)
+    I = np.interp(lmax / transverse, Kg, cum) - np.interp(lmin / transverse, Kg, cum)
     return float(np.trapezoid(W**2 * D**2 * I, chi))
 
 

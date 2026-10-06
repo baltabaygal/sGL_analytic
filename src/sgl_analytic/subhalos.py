@@ -362,12 +362,17 @@ def _mu(y):
 
 def _Om_z(cos, z):
     a3 = cos.Om * (1 + z)**3
+    if (getattr(cos, "Ok", 0.0) != 0.0 or getattr(cos, "w0", -1.0) != -1.0
+            or getattr(cos, "wa", 0.0) != 0.0):
+        return a3 / cos.E(z)**2
     return a3 / (a3 + cos.OL)
 
 
 def _Dvir(cos, z):
+    # BN LambdaCDM fit evaluated at instantaneous Omega_m(z): an explicit
+    # population-model extrapolation for w != -1, NOT wCDM spherical collapse.
     d = _Om_z(cos, z) - 1.0
-    return 18 * pi**2 + 82 * d - 39 * d * d
+    return (18 * pi**2 + 82 * d - 39 * d * d) * getattr(cos, "virial_scale", 1.0)
 
 
 if _HAVE_NUMBA:
@@ -636,8 +641,7 @@ class SubhaloModel:
                 hi = zm
         zf = 0.5 * (lo + hi)
         zz = z + (np.arange(200) + 0.5) * (zf - z) / 200
-        d = _Om_z(cos, zz) - 1
-        Ntau = np.sum(6.006 * sqrt((18 * pi**2 + 82 * d - 39 * d * d) / 178.0)
+        Ntau = np.sum(6.006 * sqrt(_Dvir(cos, zz) / 178.0)
                       / (1 + zz)) * (zf - z) / 200
         if Ntau <= 0:
             return 0.0

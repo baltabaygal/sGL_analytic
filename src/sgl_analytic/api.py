@@ -1,4 +1,5 @@
-"""Convenience API using the same cosmological parameter names as FLUMEN."""
+"""Convenience API using the same cosmological parameter names as FLUMEN,
+plus keyword-only curvature (Ok) and CPL dark energy (w0, wa)."""
 import warnings
 
 import numpy as np
@@ -22,14 +23,23 @@ def _grid(values, lo, hi, count, name):
 
 
 def generate_pdf_lnmu(z_s, h=0.674, Om=0.315, sigma8=0.811, Ob=0.0493,
-                       ns=0.965, zeq=3402.0, lnmu=None, *, lnmu_min=-1.0,
+                       ns=0.965, zeq=3402.0, lnmu=None, *, Ok=0.0, w0=-1.0,
+                       wa=0.0, growth_mode="auto", lnmu_min=-1.0,
                        lnmu_max=9.0, n_lnmu=3201, config="full", nproc=1,
                        return_info=False):
-    """Return (lnmu, dP_S/dlnmu) as NumPy arrays for a flat LCDM cosmology.
+    """Return (lnmu, dP_S/dlnmu) as NumPy arrays.
 
     z_s is required. h=H0/100; Om and Ob are density fractions; sigma8 is
     the real-space top-hat amplitude at 8/h Mpc; ns is the scalar spectral
     index; zeq is the matter-radiation equality redshift (unscaled).
+
+    Keyword-only background extensions (defaults: flat LCDM). Ok is the
+    curvature density (positive open, negative closed); dark energy has
+    Omega_DE = 1 - Om - Ok and the CPL equation of state w(a) = w0 + wa(1-a).
+    growth_mode="auto" keeps the historical LCDM growth for any Lambda model
+    and uses the GR growth ODE otherwise, which leaves a small jump at w = -1;
+    "ode" uses the ODE for every model. Compare a dark-energy model with a
+    Lambda run made with growth_mode="ode".
 
     Supply a finite, strictly increasing lnmu grid, or use the grid bounds
     and count. config accepts full, halo, +ell/+fil/+sub/+bias and the minus
@@ -45,7 +55,8 @@ def generate_pdf_lnmu(z_s, h=0.674, Om=0.315, sigma8=0.811, Ob=0.0493,
     """
     x = _grid(lnmu, lnmu_min, lnmu_max, n_lnmu, "lnmu")
     out, _ = run(z_s, config, cosmo=dict(h=h, Om=Om, sigma8=sigma8,
-                                       Ob=Ob, ns=ns, zeq=zeq),
+                                       Ob=Ob, ns=ns, zeq=zeq, Ok=Ok, w0=w0,
+                                       wa=wa, growth_mode=growth_mode),
                  xi_out=x, nproc=nproc)
     p = np.asarray(out.pop("P_s"))
     out.pop("xi")
@@ -64,7 +75,8 @@ def generate_pdf_lnmu(z_s, h=0.674, Om=0.315, sigma8=0.811, Ob=0.0493,
 
 
 def generate_pdf(z_s, h=0.674, Om=0.315, sigma8=0.811, Ob=0.0493,
-                 ns=0.965, zeq=3402.0, mu=None, *, mu_min=0.3, mu_max=30.0,
+                 ns=0.965, zeq=3402.0, mu=None, *, Ok=0.0, w0=-1.0, wa=0.0,
+                 growth_mode="auto", mu_min=0.3, mu_max=30.0,
                  n_mu=2000, config="full", nproc=1, return_info=False):
     """Return (mu, p_S(mu)); cosmological inputs match generate_pdf_lnmu.
 
@@ -83,6 +95,7 @@ def generate_pdf(z_s, h=0.674, Om=0.315, sigma8=0.811, Ob=0.0493,
         if np.any(mu <= 0):
             raise ValueError("mu must be positive")
         x = np.log(mu)
-    result = generate_pdf_lnmu(z_s, h, Om, sigma8, Ob, ns, zeq, x,
-                               config=config, nproc=nproc, return_info=return_info)
+    result = generate_pdf_lnmu(z_s, h, Om, sigma8, Ob, ns, zeq, x, Ok=Ok, w0=w0,
+                               wa=wa, growth_mode=growth_mode, config=config,
+                               nproc=nproc, return_info=return_info)
     return (mu, result[1] / mu, result[2]) if return_info else (mu, result[1] / mu)

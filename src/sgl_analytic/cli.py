@@ -3,6 +3,9 @@
 
   python run_pdf.py --zs 1
   python run_pdf.py --zs 3 --s8 0.75 --Om 0.30 --out output/pdf_zs3_s8lo.json
+  python run_pdf.py --zs 1 --Ok 0.05 --out output/pdf_zs1_open.json
+  python run_pdf.py --zs 1 --wa 0.3 --out output/pdf_zs1_cpl.json
+  python run_pdf.py --zs 1 --growth-mode ode --out output/pdf_zs1_lcdm_ode.json
 
 Writes JSON with xi = ln mu on [-1, 1] and P_s = source-plane dP/d ln mu there,
 xi_tail / P_s_tail on (1, 9] (same normalisation), plus moments and timings.
@@ -15,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .pipeline import P, clipped_moments, run
+from .pipeline import EXTENSIONS, P, clipped_moments, run
 
 
 def main(argv=None):
@@ -27,6 +30,15 @@ def main(argv=None):
     ap.add_argument("--sigma8", "--s8", dest="s8", type=float, default=P["s8"])
     for name in ("Ob", "ns", "zeq"):
         ap.add_argument(f"--{name}", type=float, default=P[name])
+    ap.add_argument("--Ok", "--Omega-K", "--Omega_K", dest="Ok", type=float,
+                    default=EXTENSIONS["Ok"], help="curvature: > 0 open, < 0 closed (default flat)")
+    ap.add_argument("--w0", type=float, default=EXTENSIONS["w0"],
+                    help="dark energy w(a) = w0 + wa (1 - a) (default -1)")
+    ap.add_argument("--wa", type=float, default=EXTENSIONS["wa"], help="CPL slope (default 0)")
+    ap.add_argument("--growth-mode", "--growth_mode", dest="growth_mode",
+                    choices=("auto", "ode", "legacy"), default=EXTENSIONS["growth_mode"],
+                    help='growth: "auto" (historical for Lambda, ODE otherwise) or "ode" '
+                         '(ODE for every model; use it for a Lambda reference)')
     ap.add_argument("--config", default="full",
                     help='lens model: "full" (default), "halo", "+ell", "-sub", ... '
                          '(pass minus arms as --config=-sub)')
@@ -37,7 +49,8 @@ def main(argv=None):
 
     try:
         out, _ = run(a.zs, a.config, nproc=a.nproc,
-                     cosmo=dict(h=a.h, Om=a.Om, s8=a.s8, Ob=a.Ob, ns=a.ns, zeq=a.zeq),
+                     cosmo=dict(h=a.h, Om=a.Om, s8=a.s8, Ob=a.Ob, ns=a.ns, zeq=a.zeq,
+                                Ok=a.Ok, w0=a.w0, wa=a.wa, growth_mode=a.growth_mode),
                      xi_out=np.linspace(-1.0, 1.0, 1601),
                      xi_tail=np.linspace(1.005, 9.0, 1600))
     except ValueError as exc:

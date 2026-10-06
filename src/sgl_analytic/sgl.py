@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import numpy as np
 from numpy import log, exp, sqrt, sin, cos, pi
-from scipy.integrate import quad
+from scipy.integrate import quad, solve_ivp
 from scipy.interpolate import CubicSpline
 from scipy.special import gamma as Gamma
 
@@ -52,11 +52,14 @@ except ImportError:
 # ============================== 0. constants ================================
 # Planck-2018 benchmark == the C++ engine defaults.
 DEFAULTS = dict(h=0.674, Om=0.315, Ob=0.0493, s8=0.811, ns=0.965,
-                TCMB=2.7255, dc=1.686, zeq=3402.0)
+                TCMB=2.7255, dc=1.686, zeq=3402.0, Ok=0.0)
 
 CKMS = 299792.458            # km/s
 RHOC0_UNIT = 2.77536627e11   # Msun/Mpc^3 / h^2
 GNEWT = 4.30091e-9           # Mpc (km/s)^2 / Msun
+
+
+PK_MODELS = (None, "fdm", "wdm", "wn")
 
 
 class Cosmology:
@@ -65,7 +68,9 @@ class Cosmology:
     def __init__(self, h=None, Om=None, Ob=None, s8=None, ns=None,
                  TCMB=None, dc=None, zeq=None,
                  window="tophat", transfer="nowiggle", conc_model=14,
-                 anchor="tophat"):
+                 anchor="tophat", pk_mod=None, pk_par=None, Ok=0.0,
+                 w0=-1.0, growth_mode="auto", growth_w0=None,
+                 conc_scale=1.0, virial_scale=1.0, wa=0.0, growth_wa=None):
         d = DEFAULTS
         self.h = d["h"] if h is None else h
         self.Om = d["Om"] if Om is None else Om
@@ -81,7 +86,48 @@ class Cosmology:
         self.conc_model = conc_model
         self.dc = d["dc"] if dc is None else dc
         self.zeq = d["zeq"] if zeq is None else zeq
-        self.OL = 1.0 - self.Om
+        self.Ok = float(Ok)  # Omega_K > 0 is open; Omega_K < 0 is closed.
+        if not np.isfinite(self.Ok):
+            raise ValueError("Ok must be finite")
+        self.OL = 1.0 - self.Om - self.Ok
+        # Smooth CPL dark energy in GR; no radiation/DE perturbations.
+        # Separate growth parameters are diagnostic, not physical cosmologies.
+        self.w0 = float(w0)
+        self.wa = float(wa)
+        self.growth_w0 = self.w0 if growth_w0 is None else float(growth_w0)
+        self.growth_wa = self.wa if growth_wa is None else float(growth_wa)
+        if not (-2.0 <= self.w0 < -0.3 and -2.0 <= self.growth_w0 < -0.3):
+            raise ValueError("smooth-DE pilot requires -2 <= w0, growth_w0 < -0.3")
+        if not (np.isfinite(self.wa) and np.isfinite(self.growth_wa)):
+            raise ValueError("wa and growth_wa must be finite")
+        for w0_check, wa_check in ((self.w0, self.wa),
+                                   (self.growth_w0, self.growth_wa)):
+            if wa_check != 0.0:
+                if w0_check + wa_check >= -0.3:
+                    raise ValueError("CPL pilot requires w0 + wa < -0.3 for matter-era growth")
+                early_ratio = self.OL / self.Om * exp(
+                    -3 * (w0_check + wa_check) * log(1e-6)
+                    + 3 * wa_check * (1e-6 - 1))
+                if abs(early_ratio) > 1e-5:
+                    raise ValueError("CPL early dark energy exceeds matter-era initialization tolerance")
+        if growth_mode not in ("auto", "legacy", "ode"):
+            raise ValueError("growth_mode must be auto, legacy or ode")
+        lambda_de = self.w0 == self.growth_w0 == -1.0 and self.wa == self.growth_wa == 0.0
+        if growth_mode == "legacy" and not lambda_de:
+            raise ValueError("legacy growth is only valid for LambdaCDM")
+        self.growth_mode = ("legacy" if lambda_de
+                            else "ode") if growth_mode == "auto" else growth_mode
+        # E^2 > 0 over the whole growth table, a in [1e-6, 1] (2026-10-06): a
+        # strongly closed model otherwise failed later inside a spline.
+        with np.errstate(invalid="ignore"):
+            e_grid = self.E(1.0 / np.geomspace(1e-6, 1.0, 4096) - 1.0)
+        if not np.all(e_grid > 0):
+            raise ValueError("E(z)^2 <= 0 somewhere in 0 <= z <= 1e6: "
+                             "outside the supported (non-bouncing) domain")
+        self.conc_scale, self.virial_scale = float(conc_scale), float(virial_scale)
+        if not (np.isfinite(self.conc_scale) and self.conc_scale > 0
+                and np.isfinite(self.virial_scale) and self.virial_scale > 0):
+            raise ValueError("profile scales must be finite and positive")
         self.H0 = 100.0 * self.h
         self.rhoc0 = RHOC0_UNIT * self.h**2
         self.rhom = self.Om * self.rhoc0        # comoving matter density
@@ -91,13 +137,29 @@ class Cosmology:
             raise ValueError("transfer must be 'nowiggle' or 'eh98'")
         self.window = window
         self.transfer = transfer
+        if pk_mod not in PK_MODELS:
+            raise ValueError(f"pk_mod must be one of {PK_MODELS}")
+        self.pk_mod = pk_mod
+        self.pk_par = dict(pk_par or {})
         self._build_growth()
         self._build_power()
         self._build_sigma()
 
     # ---------------------------- background --------------------------------
+    def w(self, z):
+        """CPL equation of state w(z)=w0+wa*z/(1+z)."""
+        z = np.asarray(z, float)
+        return self.w0 + self.wa * z / (1 + z)
+
     def E(self, z):
-        return sqrt(self.Om * (1 + z)**3 + self.OL)
+        if self.w0 == -1.0 and self.wa == 0.0 and self.Ok == 0.0:
+            return sqrt(self.Om * (1 + z)**3 + self.OL)
+        zp1 = 1 + np.asarray(z, float)
+        if self.wa == 0.0:
+            de = self.OL if self.w0 == -1.0 else self.OL * zp1**(3 * (1 + self.w0))
+        else:
+            de = self.OL * zp1**(3 * (1 + self.w0 + self.wa)) * exp(-3 * self.wa * (1 - 1/zp1))
+        return sqrt(self.Om * zp1**3 + self.Ok * zp1**2 + de)
 
     def Hz(self, z):
         return self.H0 * self.E(z)
@@ -121,11 +183,38 @@ class Cosmology:
             c[key] = v
         return v
 
-    def DA(self, z):
-        return self.chi(z) / (1 + z)
+    def f_K(self, chi):
+        """Transverse comoving distance S_K(chi) [Mpc], for any radial interval.
 
-    def DA_ls(self, zl, zs):                    # flat universe
-        return (self.chi(zs) - self.chi(zl)) / (1 + zs)
+        Open: D_H sinh(sqrt(Ok) chi/D_H)/sqrt(Ok); closed: sin instead.
+        The small-curvature series makes the flat limit continuous without
+        losing precision. Radial chi itself remains c int dz/H(z).
+        """
+        if self.Ok == 0.0:
+            return chi
+        radial = np.asarray(chi, float)
+        u = radial * self.H0 / CKMS
+        t = self.Ok * u**2
+        x = sqrt(abs(self.Ok)) * u
+        if self.Ok < 0 and np.any(x >= pi):
+            raise ValueError("radial distance reaches the antipode of the closed universe")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = (np.sinh(x) / x if self.Ok > 0 else np.sin(x) / x)
+        ratio = np.where(abs(t) < 1e-5, 1 + t/6 + t**2/120 + t**3/5040, ratio)
+        out = radial * ratio
+        return float(out) if out.ndim == 0 else out
+
+    def DM(self, z):
+        return self.f_K(self.chi(z))
+
+    def DA(self, z):
+        return self.DM(z) / (1 + z)
+
+    def DL(self, z):
+        return (1 + z) * self.DM(z)
+
+    def DA_ls(self, zl, zs):
+        return self.f_K(self.chi(zs) - self.chi(zl)) / (1 + zs)
 
     def Sigma_cr(self, zl, zs):                 # Msun/Mpc^2, physical D_A's
         return (CKMS**2 * self.DA(zs)
@@ -149,8 +238,15 @@ class Cosmology:
         E(a) itself stays analytic and is NOT splined, so all of the fast
         a-dependence is carried exactly.
         """
+        if self.growth_mode == "ode":
+            self._build_growth_ode()
+            return
+
         def Ea(a):
-            return sqrt(self.Om * np.asarray(a, float)**-3 + self.OL)
+            if self.Ok == 0.0:
+                return sqrt(self.Om * np.asarray(a, float)**-3 + self.OL)
+            a = np.asarray(a, float)
+            return sqrt(self.Om * a**-3 + self.Ok * a**-2 + self.OL)
 
         # a in [1e-6, 1] covers z in [0, 1e6]; the chain never goes above the
         # engine's z_max = 12.34 (a = 0.0749), so this is far outside any use.
@@ -172,9 +268,47 @@ class Cosmology:
         self._Dun = Dun
         self._D0 = float(Dun(1.0))
 
+    def _build_growth_ode(self):
+        """D'' + (2 + dlnH/dlna) D' - 3 Omega_m(a) D / 2 = 0.
+
+        Primes denote ln(a). Matter-era initial data D=a, D'=a;
+        _D0 retains the unnormalized amplitude for fixed-primordial controls.
+        DOP853 dense output avoids reusing the Lambda-only integral identity.
+        """
+        w = self.growth_w0
+        wa = self.growth_wa
+        x0 = log(1e-6)
+        def rhs(x, y):
+            matter = self.Om * exp(-3 * x)
+            a = exp(x)
+            de = self.OL * exp(-3 * (1 + w + wa) * x + 3 * wa * (a - 1))
+            wz = w + wa * (1 - a)
+            curvature = self.Ok * exp(-2 * x)
+            total = matter + curvature + de
+            om = matter / total
+            dh = -0.5 * (3 * matter + 2 * curvature + 3 * (1 + wz) * de) / total
+            return (y[1], -(2 + dh) * y[1] + 1.5 * om * y[0])
+        sol = solve_ivp(rhs, (x0, 0.0), (exp(x0), exp(x0)), method="DOP853",
+                        rtol=2e-10, atol=1e-14, dense_output=True)
+        if not sol.success:
+            raise RuntimeError("dark-energy growth integration failed: " + sol.message)
+        self._growth_solution = sol
+        self._D0 = float(sol.y[0, -1])
+        self._a_growth_range = (exp(x0), 1.0)
+
+    def primordial_growth_amplitude(self):
+        """Today D for matter-era D/a=1; relative ratios set fixed-As sigma8."""
+        # Legacy integral has D/a=2/(5 Om); only the ODE has this normalization.
+        return self._D0 if self.growth_mode == "ode" else self._D0 * (2.5 * self.Om)
+
     def D(self, z):
         a = 1.0 / (1 + np.asarray(z, float))
-        out = self._Dun(a) / self._D0
+        if self.growth_mode == "ode":
+            if np.any((a < self._a_growth_range[0]) | (a > 1)):
+                raise ValueError("growth redshift outside 0 <= z <= 999999")
+            out = self._growth_solution.sol(log(a))[0] / self._D0
+        else:
+            out = self._Dun(a) / self._D0
         return float(out) if np.isscalar(z) or np.ndim(z) == 0 else out
 
     # ------------------------ transfer function -----------------------------
@@ -260,7 +394,58 @@ class Cosmology:
 
     def _build_power(self):
         self._kg = np.logspace(-5, 3, 4000)
-        self._Pshape = self._kg**self.ns * self.T(self._kg)**2
+        self._Pshape = self.Pshape(self._kg)
+
+    # ---------------- small-scale P(k) modifications (2026-10-06) -----------
+    # Urrutia et al. 2025 (A&A, papers/misc/Urrutia_2025_*.pdf), Sec. 3:
+    #   "fdm": P = T_F^2 P_CDM, Passaglia & Hu 2022 fit, Eqs. (9)-(11);
+    #          pk_par = {"m22": m_FDM / 1e-22 eV, "n": 2.5}
+    #   "wdm": P = T_W^2 P_CDM, Bode/Viel fit, Eqs. (12)-(13);
+    #          pk_par = {"m_keV": m_WDM / keV}
+    #   "wn":  P = P_CDM(k) + P_CDM(k_c) for k < k_cut (white noise of axion
+    #          miniclusters / PBHs), Eq. (14);  pk_par = {"kc": Mpc^-1,
+    #          "kcut": Mpc^-1 (default: no cut)}
+    # sigma8 stays anchored to the input value through the modified P(k), as in
+    # Urrutia et al. (their normalisation A). pk_mod=None is bit-identical to
+    # the unmodified code.
+    def Pshape(self, k):
+        """Un-normalised linear P(k) shape: k^ns T(k)^2 times the modification."""
+        base = k**self.ns * self.T(k)**2
+        m, p = self.pk_mod, self.pk_par
+        if m is None:
+            return base
+        if m == "fdm":
+            return base * self._T_fdm(k)**2
+        if m == "wdm":
+            return base * self._T_wdm(k)**2
+        kc = float(p["kc"])
+        add = kc**self.ns * self.T(np.array([kc]))[0]**2
+        kcut = float(p.get("kcut", np.inf))
+        return base + np.where(np.asarray(k) < kcut, add, 0.0)
+
+    def _T_fdm(self, k):
+        """Passaglia & Hu 2022 FDM transfer function (Urrutia+25 Eqs. 9-11).
+        k_J uses Omega_FDM = Omega_c (all of the dark matter). n = 5/2 is the
+        Passaglia & Hu value (not printed in Urrutia+25; check before quoting)."""
+        m22 = float(self.pk_par["m22"])
+        n = float(self.pk_par.get("n", 2.5))
+        wc = (self.Om - self.Ob) * self.h**2
+        kJ = 66.5 / (1 + self.zeq)**0.25 * (wc / 0.12)**0.25 * m22**0.5
+        A = 2.22 * m22**(1 / 25 + log(m22) / 1000)
+        B = 0.16 * m22**(-1 / 20)
+        x = A * np.asarray(k, float) / kJ
+        xn = x**n
+        with np.errstate(invalid="ignore", divide="ignore"):
+            t = np.where(xn < 1e-8, 1.0, sin(xn) / (xn * (1 + B * x**(6 - n))))
+        return t
+
+    def _T_wdm(self, k):
+        """Thermal WDM transfer function (Urrutia+25 Eqs. 12-13), alpha in Mpc."""
+        mk = float(self.pk_par["m_keV"])
+        mu = 1.12
+        alpha = (0.049 * mk**-1.11 * ((self.Om - self.Ob) / 0.25)**0.11
+                 * (self.h / 0.7)**1.22) / self.h
+        return (1 + (alpha * np.asarray(k, float))**(2 * mu))**(-5 / mu)
 
     def _sigmaR_shape(self, R, window=None):
         w = self.window if window is None else window
@@ -352,10 +537,10 @@ class Cosmology:
             beta = 0.307 * a**0.540
             g1 = 0.628 * a**-0.047
             g2 = 0.317 * a**-0.893
-            return c0 * q**-g1 * (1.0 + q**(1.0 / beta))**(-beta * (g2 - g1))
+            return self.conc_scale * c0 * q**-g1 * (1.0 + q**(1.0 / beta))**(-beta * (g2 - g1))
         a = 0.520 + (0.905 - 0.520) * exp(-0.617 * z**1.21)
         b = -0.101 + 0.026 * z
-        return 10.0**(a + b * np.log10(M * h / 1e12))
+        return self.conc_scale * 10.0**(a + b * np.log10(M * h / 1e12))
 
     def nfw_params(self, M, zl, zs):
         C = self.conc(M, zl, self.h)
@@ -619,10 +804,15 @@ def _cosmology_kwargs(cos):
     """Plain-kwarg snapshot of a Cosmology -- Cosmology itself is NOT
     picklable (``_Dun`` is a closure built in ``_build_growth``), so
     multiprocess workers rebuild it from this instead of pickling ``cos``."""
-    return dict(h=cos.h, Om=cos.Om, Ob=cos.Ob, s8=cos.s8, ns=cos.ns,
+    return dict(h=cos.h, Om=cos.Om, Ok=cos.Ok, Ob=cos.Ob, s8=cos.s8, ns=cos.ns,
                 TCMB=cos.TCMB, dc=cos.dc, zeq=cos.zeq,
                 window=cos.window, transfer=cos.transfer,
-                conc_model=cos.conc_model, anchor=cos.anchor)
+                conc_model=cos.conc_model, anchor=cos.anchor,
+                pk_mod=getattr(cos, "pk_mod", None),
+                pk_par=dict(getattr(cos, "pk_par", {}) or {}),
+                w0=cos.w0, growth_w0=cos.growth_w0, growth_mode=cos.growth_mode,
+                wa=cos.wa, growth_wa=cos.growth_wa,
+                conc_scale=cos.conc_scale, virial_scale=cos.virial_scale)
 
 
 def _R_of_xi_zchunk(payload):
