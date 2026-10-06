@@ -15,7 +15,7 @@ ZS = 1.0
 # temperature are held at the sgl.DEFAULTS values; sigma_8 is a real-space
 # top-hat sigma_8 (the engine's anchor).  Changing sigma_8 moves sigma(M), the
 # mass function, the Ludlow+16 concentrations and the linear P(k) together.
-COSMO = dict(h=0.674, Om=0.315, s8=0.811)
+COSMO = dict(h=0.674, Om=0.315, s8=0.811, Ob=0.0493, ns=0.965, zeq=3402.0)
 
 # Lens model: "full" = halos + ellipticity + filaments + subhalos + clustering.
 # Single-ingredient arms: "halo" (spherical halos only), "+ell", "+fil",
