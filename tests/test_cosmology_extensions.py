@@ -1,9 +1,11 @@
 """Curvature and CPL dark energy against independent references (fast, no solves).
 
-Ported from the stochastic_wl_analytic tests (2026-10-06). The references
-re-derive each quantity a different way: energy conservation instead of the
-closed CPL density, the transverse Jacobi equation instead of sinh/sin, and
-growth ODEs in another variable with another integrator and start time.
+Ported from the stochastic_wl_analytic tests (2026-10-06; dark-energy domain
+updated 2026-10-21). The references re-derive each quantity a different way:
+energy conservation instead of the closed CPL density, the transverse Jacobi
+equation instead of sinh/sin, and growth ODEs in another variable with another
+integrator and start time. sgl.Cosmology() is the library default (no
+radiation); the pipeline default adds radiation (test_radiation_and_edge.py).
 """
 import numpy as np
 import pytest
@@ -158,9 +160,18 @@ def test_geometry_growth_split_is_diagnostic_only():
     assert split.E(1.) != ref.E(1.)
 
 
-@pytest.mark.parametrize("kw", [dict(w0=0.), dict(w0=np.nan), dict(wa=np.inf), dict(wa=.8),
-                                dict(growth_wa=.8), dict(wa=.2, growth_mode="legacy"),
+# domain: -2 <= w0 <= 1, w0 + wa < 0, rho_DE/rho_m <= 1e-2 at z = 1100
+@pytest.mark.parametrize("kw", [dict(w0=0.), dict(w0=-2.5), dict(w0=np.nan), dict(wa=np.inf),
+                                dict(wa=1.2), dict(growth_wa=1.2), dict(w0=.3, wa=-.4),
+                                dict(w0=-.5, wa=.45), dict(wa=.2, growth_mode="legacy"),
                                 dict(w0=-.8, growth_mode="legacy")])
 def test_unsupported_dark_energy_rejected(kw):
     with pytest.raises(ValueError):
         sgl.Cosmology(**kw)
+
+
+@pytest.mark.parametrize("kw", [dict(wa=.8), dict(w0=-.28), dict(w0=.3, wa=-.9)])
+def test_widened_dark_energy_domain_accepted(kw):
+    c = sgl.Cosmology(growth_mode="ode", **kw)
+    assert c.de_matter_ratio(1100.) <= c.de_rec_cap
+    assert np.all(np.diff(c.D([0., 1., 3., 10.])) < 0)

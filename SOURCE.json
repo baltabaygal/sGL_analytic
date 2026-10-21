@@ -1,0 +1,17 @@
+{
+ "source_repository": "/Users/baltabay/Desktop/stochastic_wl_analytic",
+ "source_commit": "3ce5e2e96ed1149662bffa7948a22e9329cb7615",
+ "source_branch": "fix/lowz-2026-10-19",
+ "source_analytic_dirty": true,
+ "synced": "2026-10-21",
+ "sha256": {
+  "sgl.py": "b7f62d390f538f52e4598e0567281f14ce8103ad157531de4d4f4d404aa66d21",
+  "sgl_full.py": "201e5906fa6f5915d580833d7d63d3c2d0451fcde68dd6efa3ead43c1aee9bff",
+  "subhalos.py": "5a8cc5620c5f14ba95ff8d746d8b598f3d8d1b35d60227e42aae74f399141c89",
+  "subhalos_exact.py": "2f4b268f2e7f35daa4c7bf26f0fd46b16c76a0a15f8886364012bcbd92194398",
+  "filaments.py": "7500721a3c34a2a60acff7dced028330a5548010237e9223eb5cd52594beccad",
+  "pos_closure.py": "e66e79c51d27018f36d3cff5e8094f744b472746d38a8dc5707881dcb4e4ab8e",
+  "pos_closure_fused.py": "92dfd04e85899f27d58e8d9c0ac478d74153c72b1b92c9ed5c522642f603d7dc",
+  "sgl_direct.py": "1a55f5fe8551e85fc4833dbbebcb83861dba5c04b48ebcc46d5a1afbf97cdaa4"
+ }
+}

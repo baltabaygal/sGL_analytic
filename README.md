@@ -5,7 +5,11 @@ and a LCDM cosmology, optionally with spatial curvature and time-varying (CPL)
 dark energy. The solver builds a lens population, evaluates its
 compensated compound-Poisson characteristic function with a two-point clustering
 correction, and inverts it to a source-plane PDF. A calculation takes roughly
-10–30 seconds on an M-series laptop; this is a numerical solver, not an emulator.
+10–25 seconds on an M-series laptop (35–45 s with the positive clustering
+closure); this is a numerical solver, not an emulator.
+
+Version 0.2.0 (2026-10-21) carries the current default chain of the research
+repository; see [Changes in 0.2.0](#changes-in-020) for what moved.
 
 ## Install from this repository
 
@@ -42,6 +46,9 @@ print(info['sigma_kappa'], info['diagnostics'])
 
 # open universe with evolving dark energy, w(a) = -1 + 0.3 (1 - a)
 lnmu, pdf_lnmu = generate_pdf_lnmu(z_s=1.0, Ok=0.05, w0=-1.0, wa=0.3)
+
+# low source redshift: the positive clustering closure
+lnmu, pdf_lnmu = generate_pdf_lnmu(z_s=0.3, closure="vp")
 ```
 
 Both functions return two NumPy arrays. `return_info=True` adds a third value
@@ -69,7 +76,14 @@ Keyword-only background extensions (not FLUMEN inputs):
 | `Ok` | Curvature density Omega_K; positive is open, negative closed | 0.0 |
 | `w0` | Dark-energy equation of state today | -1.0 |
 | `wa` | CPL slope: w(a) = w0 + wa (1 - a) | 0.0 |
-| `growth_mode` | Linear growth: `"auto"` or `"ode"` (see below) | `"auto"` |
+| `growth_mode` | Linear growth: `"ode"` or `"auto"` (see below) | `"ode"` |
+| `radiation` | `"engine"`: Omega_r = Om/(1 + zeq) in the background; `None`: none | `"engine"` |
+
+Keyword-only model option:
+
+| Parameter | Meaning | Default |
+|---|---|---:|
+| `closure` | Clustering beyond second order: `"gauss"` or `"vp"` (see [Model scope](#model-scope)) | `"gauss"` |
 
 The six FLUMEN inputs must be finite and positive, with 0 < Ob < Om <= 1; `Ok`,
 `w0` and `wa` must be finite. The CMB temperature is held at 2.7255 K. There
@@ -77,13 +91,15 @@ are no neutrino-mass inputs. The transfer function is EH98, with a smooth-k
 mass-variance window and a real-space top-hat sigma8 normalization;
 concentrations use Ludlow+16. sigma8 is fixed at z = 0 for every background.
 
-### Curvature and dark energy
+### Curvature, dark energy and radiation
 
-The background has no radiation. With a = 1/(1+z) and Omega_DE = 1 − Om − Ok,
+With a = 1/(1+z), Omega_r = Om/(1 + zeq) and Omega_DE = 1 − Om − Omega_r − Ok,
 
-    E^2(a) = Om a^-3 + Ok a^-2 + Omega_DE a^(-3(1+w0+wa)) exp(3 wa (a − 1)),
+    E^2(a) = Om a^-3 + Omega_r a^-4 + Ok a^-2 + Omega_DE a^(-3(1+w0+wa)) exp(3 wa (a − 1)),
 
-so the defaults give flat LCDM. Transverse comoving distances are
+so the defaults give flat LCDM with radiation, as in the C++ Monte Carlo engine.
+zeq is a free input, not derived from Om h^2. `radiation=None` sets Omega_r = 0
+(the background of version 0.1). Transverse comoving distances are
 f_K(chi) = (c/H0) sinh(sqrt(Ok) H0 chi/c)/sqrt(Ok) for an open universe (sin and
 −Ok for a closed one), and the lens-source angular-diameter distance is
 f_K(chi_s − chi_l)/(1 + z_s). These enter the critical
@@ -91,34 +107,37 @@ surface density, and H(z) enters the critical density and the lens rate per
 unit area. The Limber clustering term stays local and flat-sky.
 
 Linear growth is general-relativistic and scale independent, with smooth dark
-energy (no dark-energy perturbations). `growth_mode="ode"` solves
+energy (no dark-energy perturbations). The default `growth_mode="ode"` solves
 D'' + (2 + dlnH/dlna) D' = (3/2) Omega_m(a) D in ln a, with the instantaneous
-w(a) in dlnH/dlna. The default `"auto"` keeps the historical LCDM treatment for
-any Lambda model, flat or curved: the exact growth integral for sigma(M), and
-the Carroll–Press–Turner approximation for halo bias and M*. For any other
+w(a) and the radiation term in dlnH/dlna, from the matter–radiation growing mode
+D = a + (2/3) a_eq. The same D enters sigma(M), halo bias, M*, delta_c(z) and
+the subhalo formation redshifts. `"auto"` keeps the historical LCDM treatment
+for any Lambda model, flat or curved: the exact growth integral for sigma(M),
+and the Carroll–Press–Turner approximation for halo bias and M*; for any other
 w0, wa it uses the ODE everywhere. The two treatments differ slightly, so
-`"auto"` jumps at w = −1: the clipped variance of ln mu changes by a relative
-2e-4 at z_s = 1.
-Compare a dark-energy model with an LCDM run made with `growth_mode="ode"`;
-the solver warns when `"auto"` switches to the ODE. The stored reference PDFs
-use `"auto"`.
+`"auto"` jumps at w = −1 (a relative 2e-4 in the clipped variance of ln mu at
+z_s = 1), and the solver warns when `"auto"` switches to the ODE. With the
+default `"ode"`, Lambda and dark-energy runs are directly comparable.
 
-The supported domain is −2 <= w0 < −0.3. When wa ≠ 0 it also requires
-w0 + wa < −0.3 and negligible dark energy at a = 1e-6, where growth starts in
-the matter era. Cosmologies with E^2 <= 0 at some z <= 1e6 are rejected, as
-are closed-universe distances that reach the antipode.
+The supported domain is −2 <= w0 <= 1 and w0 + wa < 0 (matter domination at
+early times), with rho_DE/rho_m <= 1e-2 at z = 1100, so that the EH98 transfer
+function and the matter-era start of the growth ODE stay valid. Cosmologies
+with E^2 <= 0 at some z <= 1e6 are rejected, as are closed-universe distances
+that reach the antipode.
 
 The lens population is not recalibrated for curvature or dark energy. The
 Sheth–Tormen mass function, halo bias and Allgood ellipticities respond
 through sigma(M, z), growth and H(z). The Ludlow+16 concentration fit
 depends on sigma(M) at z = 0 and on z, so at fixed sigma8 it does not respond
-to the growth history. The virial radius uses the Bryan–Norman LCDM fit,
-evaluated at the instantaneous Omega_m(z). These are extrapolations of
-LCDM-calibrated relations, not results for curved or CPL cosmologies.
+to the growth history. The Bryan–Norman virial overdensity, evaluated at the
+instantaneous Omega_m(z), enters only the subhalo calibration (and the halo
+edge with `edge="rvir"`). These are extrapolations of LCDM-calibrated
+relations, not results for curved or CPL cosmologies.
 
-Stored regression PDFs cover z_s = 0.5, 1, 3 and 10 at the default cosmology.
-They establish numerical reproducibility, not accuracy over a parameter box.
-FLUMEN's emulator training ranges are not validation ranges for this solver.
+Stored regression PDFs cover z_s = 0.5, 1, 3 and 10 at the default cosmology,
+and the positive closure at z_s = 0.5 and 1. They establish numerical
+reproducibility, not accuracy over a parameter box. FLUMEN's emulator training
+ranges are not validation ranges for this solver.
 
 ### Grids and density conventions
 
@@ -166,7 +185,8 @@ sgl-analytic --z-s 3 --h 0.70 --Om 0.30 --sigma8 0.90 --Ob 0.05 --ns 0.97 --zeq 
 python -m sgl_analytic --z-s 1 --config=-sub --nproc 4
 sgl-analytic --z-s 1 --Ok 0.05 --out pdf_open.json
 sgl-analytic --z-s 1 --w0 -1 --wa 0.3 --out pdf_cpl.json
-sgl-analytic --z-s 1 --growth-mode ode --out pdf_lcdm_ode.json   # LCDM reference for w models
+sgl-analytic --z-s 0.3 --closure vp --out pdf_zs0.3_vp.json   # positive clustering closure
+sgl-analytic --z-s 1 --radiation none --growth-mode auto --out pdf_v01_background.json
 ```
 
 The command writes JSON with `xi` and `P_s` on lnmu ∈ [−1, 1], plus
@@ -181,17 +201,38 @@ The original `python run_pdf.py --zs 1 --s8 0.811` remains supported.
 ## Model scope
 
 The default includes Sheth–Tormen field halos with NFW profiles truncated at
-r_vir, pseudo-elliptical projections, full filament cross-sections, decorated
-hosts with moment-quadrature subhalos, and linear-bias clustering with the 3D
-linear correlation function in the Limber approximation. Lens-redshift
-integration uses midpoint shells covering [0, z_s].
+r200c (each halo encloses exactly its mass-function mass M200), pseudo-elliptical
+projections, full filament cross-sections, decorated hosts with
+moment-quadrature subhalos, and linear-bias clustering with the 3D linear
+correlation function in the Limber approximation. Subhalos follow the same
+convention: the virial-unit calibrated population is kept inside the host's
+r200, and each clump is an NFW halo with M200 = m cut at its own r200.
+`pipeline.run(..., edge="rvir")` truncates halos and clumps at the virial radius
+instead (the version 0.1 default). Lens-redshift integration uses midpoint
+shells covering [0, z_s].
+
+Clustering has two-point accuracy. Beyond second order there are two closures:
+
+- `closure="gauss"` (default): the Gauss–Poisson pair term, whose random lens
+  intensity is Gaussian and can go negative. At low z_s and high sigma8 this can
+  leave negative regions in the inverted PDF: at the Planck cosmology and
+  z_s = 0.5 a lobe of 4e-5 of the peak at the lower edge (negative mass 1.6e-5).
+- `closure="vp"`: a positive variance-preserving Cox closure on the same lens
+  cells, with the same mean rates and the same convergence and shear clustering
+  variances. It is a valid characteristic function at every z_s (negative mass
+  1e-9 at z_s = 0.5) and differs from the Gaussian closure by 2.3e-3 / 1.1e-3 of
+  the peak at z_s = 0.5 / 1. It costs about three times as much. Use it below
+  z_s ~ 0.5, or wherever the diagnostics report negative mass.
 
 The Born approximation adds lens distortions, and the magnification map uses
 the weak, positive-parity branch. Subhalo shear is represented by a conditional
-rms and clustering is truncated at the two-point term. High-magnification
-output does not constitute a complete strong-lensing calculation. This model
-also differs from FLUMEN's simulation model in halo truncation and clustering;
-matching cosmological inputs does not imply identical PDFs or flux calibration.
+rms. High-magnification output does not constitute a complete strong-lensing
+calculation. This model also differs from FLUMEN's simulation model in halo
+truncation and clustering; matching cosmological inputs does not imply
+identical PDFs or flux calibration. The difference grows toward low z_s, where
+the engine's untruncated halo outskirts matter most: below z_s ~ 0.5 the PDF
+depends strongly on the halo-edge model (for halos alone at z_s = 0.2, r200
+truncation gives about twice the peak height of the engine's untruncated halos).
 
 ## Notebooks and advanced use
 
@@ -207,8 +248,9 @@ its generator is `scripts/build_explorer.py`. Install the `notebooks` extra
 before running either. Exported `zeq` is included in the solver metadata.
 
 Advanced users can import `sgl_analytic.pipeline.run` for the original
-`(out, meta)` interface and numerical options. Its cosmology dictionary accepts
-`sigma8` or the legacy `s8`, plus h, Om, Ob, ns, zeq, Ok, w0, wa and growth_mode. Compatibility modules
+`(out, meta)` interface and numerical options (`edge`, `xi_closure`, `phi_tol`,
+`grid_scale`, ...). Its cosmology dictionary accepts `sigma8` or the legacy `s8`,
+plus h, Om, Ob, ns, zeq, Ok, w0, wa, growth_mode and radiation. Compatibility modules
 in `src/` keep existing notebooks working; installed code uses relative package
 imports without modifying sys.path.
 
@@ -218,14 +260,56 @@ With the package installed:
 
 ```bash
 python -m unittest discover -s tests -p test_api.py
-python -m pytest tests/test_cosmology_extensions.py
+python -m pytest tests/test_cosmology_extensions.py tests/test_radiation_and_edge.py
 python tests/test_reference.py 0.5 1 3 10
+python tests/test_reference.py --closure vp 0.5 1
 ```
 
 The first command checks the public input and density contracts. The second
-checks curvature and dark energy against independent references: distances from
-the transverse Jacobi equation, the dark-energy density from energy
-conservation, and growth from separate ODE solvers and the constant-w
-hypergeometric solution. The third checks default PDFs against stored
-references, with a tolerance of 1e-9 of the body peak. For pytest, install the `test` extra and run `python -m pytest`.
-The expensive reference regression remains a separate explicit command.
+checks curvature, dark energy and radiation against independent references:
+distances from the transverse Jacobi equation, the dark-energy density from
+energy conservation, growth from separate ODE solvers and the constant-w
+hypergeometric solution, the engine's radiation closure, and the r200c subhalo
+convention. The last two check default and positive-closure PDFs against stored
+references, with a tolerance of 1e-9 of the body peak. For pytest, install the
+`test` extra and run `python -m pytest`. The expensive reference regressions
+remain separate explicit commands.
+
+## Provenance
+
+The physics modules in `src/sgl_analytic/` (`sgl`, `sgl_full`, `subhalos`,
+`subhalos_exact`, `filaments`, `pos_closure`, `pos_closure_fused`, `sgl_direct`)
+are copies of the research repository's `analytic/` files with only the local
+imports made relative. `scripts/sync_from_analytic.py` performs that copy and
+writes `SOURCE.json` (source commit, branch, whether its `analytic/` had
+uncommitted changes, and the SHA-256 of every source file); `--check` reports
+modules that have drifted. The reference PDFs in `tests/reference/` were
+produced by the research repository's own `run_full_chain.run`, not by this
+package (`scripts/make_references.py`), and this package reproduces them bit for
+bit (max|dP| = 0). After a sync, regenerate them, carry any new `run()` defaults
+over to `pipeline.py` by hand, and rerun both reference regressions.
+
+## Changes in 0.2.0
+
+The defaults follow the research repository's chain as of 2026-10-21:
+
+- halos and subhalo clumps are truncated at r200c (was r_vir);
+- the background includes radiation, Omega_r = Om/(1 + zeq) (was none);
+- linear growth from the ODE for every model, also in bias, M*, delta_c(z) and
+  subhalo formation redshifts (was `"auto"`);
+- a 101 x 101 coarse grid for the clustering term (was 51 x 51), finer
+  inversion grids (72/36 points per sigma in kappa/gamma, 2400 integration
+  nodes), a kink-split angle rule for filaments, the inferred number of
+  ellipticity angles in the subhalo sector, block-wise inversion of very large
+  grids, and a finer shear-axis grid for narrow PDFs;
+- the optional positive clustering closure (`closure="vp"`), and speed-ups of
+  the direct cell sum and the kappa transform (identical results up to
+  floating-point roundoff);
+- the dark-energy domain is wider (see above).
+
+Combined effect on the Planck reference PDFs (new vs 0.1.0), z_s = 0.5 / 1 / 3 / 10:
+sigma_kappa −2.3 / −2.0 / −1.6 / −1.4%, clipped variance of ln mu (|ln mu| <= 1)
+−3.9 / −3.9 / −3.3 / −2.8%, peak +5.3 / +3.8 / +2.4 / +1.9%, and
+max|dP| = 11 / 5.4 / 2.9 / 2.3% of the peak. `edge="rvir"`, `radiation=None`
+and `growth_mode="auto"` restore the old model choices but not the old
+numerical resolution.

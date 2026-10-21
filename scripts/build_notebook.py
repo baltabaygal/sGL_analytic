@@ -64,14 +64,15 @@ The notebook follows the solver stage by stage, in the order of the paper draft
 7. dependence on $z_s$ and $\sigma_8$.
 
 **The default lens model, and how it differs from the Monte Carlo engine.**
-Halos are truncated at their virial radii and integrated over the whole lens plane,
-so there is no convergence threshold $\kappa_{\rm thr}$, no outer radius $r_{\max}$ and
-no Gaussian treatment of faint lenses. Clustering is the linear-bias pair term with
-the 3D linear correlation function, not the engine's lognormal modulation of the
-counts along a 1D field. The lens-redshift integral runs over all of $[0, z_s]$
-(midpoint rule). Because of these choices the PDF is not meant to reproduce the
-engine's Monte Carlo bin by bin: at $z_s \lesssim 1$ its variance is a few per cent
-lower and its skewness slightly higher.
+Halos are truncated at $r_{200}$, so each encloses exactly its mass-function mass, and
+they are integrated over the whole lens plane: there is no convergence threshold
+$\kappa_{\rm thr}$, no outer radius $r_{\max}$ and no Gaussian treatment of faint lenses.
+Clustering is the linear-bias pair term with the 3D linear correlation function, not the
+engine's lognormal modulation of the counts along a 1D field. The lens-redshift integral
+runs over all of $[0, z_s]$ (midpoint rule). Because of these choices the PDF is not meant
+to reproduce the engine's Monte Carlo bin by bin: at $z_s \lesssim 1$ it is narrower, with a
+higher peak, and the difference grows toward low $z_s$, where the engine's untruncated
+halo outskirts matter most.
 
 **No physics is written in this notebook.** Every cell calls the solver in `src/`:
 
@@ -82,6 +83,7 @@ lower and its skewness slightly higher.
 | `sgl_full.py` | truncated NFW, pseudo-elliptical lensing, bias, $z$ shells, population cells `Cells`, the exponent `Lam`, inversion `invert` |
 | `filaments.py` | filament mass function and cylinder profile |
 | `subhalos.py`, `subhalos_exact.py` | subhalo population and the exact decorated-host quadrature |
+| `pos_closure.py` | the optional positive (`"vp"`) clustering closure |
 
 The inputs are in `config.py`. Change one there and rerun
 `python scripts/build_notebook.py`; nothing in the notebook itself needs editing."""))
@@ -118,10 +120,13 @@ print(f"z_s = {config.ZS}, cosmology = {config.COSMO}, config = {config.CONFIG!r
 
 **Linear power.** $P_{\rm lin}(k,z) = D(z)^2 A\,k^{n_s} T(k)^2$, with the
 Eisenstein & Hu (1998, [astro-ph/9709112](https://arxiv.org/abs/astro-ph/9709112))
-transfer function including baryon wiggles (`sgl.Cosmology._T_eh98`). $D(z)$ is the exact
-linear growth of flat $\Lambda$CDM, normalised to $D(0)=1$ (`Cosmology.D`). The amplitude $A$
-is fixed by $\sigma_8$ measured with a real-space top hat of radius $8\,h^{-1}$ Mpc,
-as in the engine.
+transfer function including baryon wiggles (`sgl.Cosmology._T_eh98`). $D(z)$ solves the
+linear growth equation $D'' + (2 + \mathrm d\ln H/\mathrm d\ln a)\,D' = \tfrac32\,\Omega_m(a)\,D$ in $\ln a$,
+normalised to $D(0)=1$ (`Cosmology.D`, `growth_mode="ode"`). The same $D$ enters the halo bias,
+$M_*$, $\delta_c(z)$ and the subhalo formation redshifts. The background includes radiation as
+in the engine, $\Omega_r = \Omega_m/(1+z_{\rm eq})$ with $z_{\rm eq}$ a free input, so $H(z)$, the distances
+and the growth all carry it. The amplitude $A$ is fixed by $\sigma_8$ measured with a
+real-space top hat of radius $8\,h^{-1}$ Mpc, as in the engine.
 
 **Variance of the mass field.** Smoothed with the engine's smooth-$k$ filter
 (`Cosmology._Ws`),
@@ -140,7 +145,8 @@ a fit in peak height $\delta_c/\sigma(M)$, so $c$ moves with $\sigma_8$ (`Cosmol
 `pipeline.make_cosmology` builds the `Cosmology` with exactly these choices."""))
 
     c.append(code(r"""cos = pipeline.make_cosmology(config.COSMO)
-print(f"h = {cos.h}, Om = {cos.Om}, Ob = {cos.Ob}, ns = {cos.ns}")
+print(f"h = {cos.h}, Om = {cos.Om}, Ob = {cos.Ob}, ns = {cos.ns}, z_eq = {cos.zeq}, "
+      f"Omega_r = {cos.Or:.3e}, growth = {cos.growth_mode!r}")
 print(f"sigma_8 (top hat, the anchor) = {cos.sigma_tophat8():.4f}")
 print(f"D(z=1) = {cos.D(1.0):.4f},  D(z=3) = {cos.D(3.0):.4f}")
 
@@ -187,19 +193,21 @@ $$\kappa = 2\kappa_s F(x),\qquad \bar\kappa = \frac{4\kappa_s\,h(x)}{x^2},\qquad
 $$F(x) = \frac{1 - A(x)/\sqrt{|1-x^2|}}{x^2-1},\qquad h(x) = \ln\frac x2 + \frac{A(x)}{\sqrt{|1-x^2|}},$$
 with $A = \operatorname{arccosh}(1/x)$ for $x<1$ and $\arccos(1/x)$ for $x>1$.
 
-**Virial truncation (default).** Unlike the engine, the profile is cut sharply in
-3D at the virial radius $r_{\rm vir} = \eta\,r_{200}$ ($x_t = \eta c$, with the Bryan & Norman
-overdensity; `subhalos._eta`). The projected convergence then vanishes beyond $x_t$, and
-the shear outside is that of a point mass with the virial mass,
-$\gamma = 4\kappa_s\,\mu(x_t)/x^2$ with $\mu(y) = \ln(1+y) - y/(1+y)$. Inside, the projection of the
-mass beyond $r_{\rm vir}$ is subtracted in closed form (`sgl_full.nfw_trunc_kg`). Truncation makes
-the projected mass of every halo finite, which is what the clustering term of Sec. 6 needs."""))
+**Truncation at $r_{200}$ (default).** Unlike the engine, the profile is cut sharply in
+3D at $r_{200}$ ($x_t = c$), so the halo encloses exactly its mass-function mass $M_{200}$. The
+projected convergence then vanishes beyond $x_t$, and the shear outside is that of a point
+mass $M_{200}$, $\gamma = 4\kappa_s\,\mu(x_t)/x^2$ with $\mu(y) = \ln(1+y) - y/(1+y)$. Inside, the projection of
+the mass beyond $r_{200}$ is subtracted in closed form (`sgl_full.nfw_trunc_kg`). Truncation makes
+the projected mass of every halo finite, which is what the clustering term of Sec. 6 needs.
+`pipeline.run(..., edge="rvir")` cuts at the virial radius $r_{\rm vir} = \eta\,r_{200}$ instead
+($x_t = \eta c$, Bryan & Norman overdensity; `subhalos._eta`)."""))
 
     c.append(code(r"""Mh, zl = config.EXAMPLE_M, config.EXAMPLE_ZL
 C_, rs, ks, fC = cos.nfw_params(Mh, zl, config.ZS)
-xt = subhalos._eta(cos, C_, zl) * C_
+xt = C_                                    # r200 / r_s: the default edge="r200"
+xt_vir = subhalos._eta(cos, C_, zl) * C_   # r_vir / r_s: edge="rvir"
 print(f"M200 = {Mh:.1e} Msun at z = {zl}: c = {C_:.2f}, r_s = {rs*1e3:.1f} kpc, "
-      f"kappa_s = {ks:.4f} (z_s = {config.ZS}), x_t = r_vir/r_s = {xt:.2f}")
+      f"kappa_s = {ks:.4f} (z_s = {config.ZS}), x_t = r200/r_s = {xt:.2f} (r_vir/r_s = {xt_vir:.2f})")
 
 x = np.logspace(-3, 2.5, 600)
 k_u, g_u = sgl.kappa_gamma(np.ascontiguousarray(x), ks)
@@ -207,7 +215,7 @@ k_t, g_t = F.nfw_trunc_kg(x, ks, xt)
 fig, ax = plt.subplots(figsize=(5.4, 3.6))
 ax.loglog(x, k_u, "C0--", lw=1, label=r"$\kappa$ untruncated")
 ax.loglog(x, g_u, "C1--", lw=1, label=r"$\gamma$ untruncated")
-ax.loglog(x, np.where(k_t > 0, k_t, np.nan), "C0", label=r"$\kappa$ truncated at $r_{\rm vir}$")
+ax.loglog(x, np.where(k_t > 0, k_t, np.nan), "C0", label=r"$\kappa$ truncated at $r_{200}$")
 ax.loglog(x, g_t, "C1", label=r"$\gamma$ truncated")
 ax.axvline(xt, color="0.5", lw=0.8); ax.text(xt * 1.1, 2e-2, r"$x_t$", color="0.4")
 ax.set(xlabel=r"$x = r/r_s$", ylabel="convergence, shear", ylim=(1e-6, 2))
@@ -338,11 +346,13 @@ with the normalisation $g$ fixed by the bound mass fraction $f_s(M,z)$ of Jiang 
 $\psi\ge10^{-4}$; the population then extends down to $m = 10^7M_\odot$, so in massive hosts the total clump mass
 fraction exceeds $f_s$. Clump positions follow the
 host's NFW density times $B(x) = [1+(x/x_0)^{-2.5}]^{-1/2}$, $x_0 = 0.86\,r_{\rm vir}/r_{200}$, projected along the line of sight.
-Each clump is an NFW halo with its virial mass $m$ and a Ludlow+16 concentration, truncated at its own
-virial radius. It contributes when the ray passes inside that radius.
+This fit is calibrated in virial units. With the default $r_{200}$ edge it is used unchanged and only the clumps
+inside the host's $r_{200}$ are kept (the fraction of the profile inside, `subhalos._frac_inside`). Each clump is
+an NFW halo with $M_{200} = m$ and a Ludlow+16 concentration, truncated at its own $r_{200}$. It contributes when the
+ray passes inside that radius.
 
-The rendered clump mass is removed from the smooth host: with $S = \sum_c m_c/v_r$ ($v_r = M_{\rm vir}/M_{200}$),
-the host is rebuilt at $M_{\rm eff} = \max(M - S, 10^7 M_\odot)$, keeping its physical truncation radius, and the composite
+The rendered clump mass is removed from the smooth host: with $S = \sum_c m_c/v_r$ ($v_r = 1$ for the $r_{200}$ edge,
+$M_{\rm vir}/M_{200}$ for `edge="rvir"`), the host is rebuilt at $M_{\rm eff} = \max(M - S, 10^7 M_\odot)$, keeping its physical truncation radius, and the composite
 jump is $\boldsymbol Q_h = \boldsymbol q_h(M_{\rm eff}) + \sum_c\boldsymbol q_c$. The single-halo factor $e^{ik_\kappa\kappa_h}J_0(k_\gamma\gamma_h)$ in $\ell$ becomes
 $$\big\langle e^{i\boldsymbol k\cdot\boldsymbol Q_h}\big\rangle_{\rm sub} = \Big\langle e^{ik_\kappa[\kappa_h(M_{\rm eff}) + K]}\,J_0(k_\gamma\Gamma)\Big\rangle_{\rm sub},\qquad
 \ln\big\langle e^{i(tK+uS)}\big\rangle = \int\mathrm d\nu\Big[e^{i(t\kappa_c + u\,m_c/v_r)} - 1\Big],$$
@@ -351,12 +361,12 @@ Poisson law define a deterministic 3-node $\times$ 3-node Gauss quadrature of th
 (`subhalos_exact.ExactSector.host_cells_moments`). $\Gamma$ is taken as its conditional rms at fixed $(K,S)$, including the
 correlation between host and clump shear directions."""))
 
-    c.append(code(r"""sub = subhalos.SubhaloModel(cos, config.ZS, None, sector="exact", clump_edge="rvir",
+    c.append(code(r"""sub = subhalos.SubhaloModel(cos, config.ZS, None, sector="exact", clump_edge="r200",
                             exact_kw=dict(method="moments"))
 zg, Mg = F.engine_grids()
 jz = int(np.argmin(abs(zg - zl)))
 print(f"host table at z = {zg[jz]:.3f}:")
-print(f"{'M200 [Msun]':>12s} {'f_s':>7s} {'<N_clump>':>10s} {'sum m / M_vir':>14s}  (all clumps m >= 1e7 Msun)")
+print(f"{'M200 [Msun]':>12s} {'f_s':>7s} {'<N_clump>':>10s} {'sum m / M200':>14s}  (clumps m >= 1e7 Msun inside r200)")
 for jM in np.searchsorted(Mg, [1e11, 1e12, 1e13, 1e14, 1e15]):
     h = sub.host(jz, int(jM))
     if h is None:
@@ -366,7 +376,7 @@ for jM in np.searchsorted(Mg, [1e11, 1e12, 1e13, 1e14, 1e15]):
 h = sub.host(jz, int(np.searchsorted(Mg, Mh)))
 fig, ax = plt.subplots(figsize=(5.2, 3.4))
 ax.loglog(h["m"], h["dN"] / np.log(h["m"][1] / h["m"][0]), "o-", ms=3)   # dN per ln-psi bin
-ax.set(xlabel=r"clump virial mass $m$ [$M_\odot$]", ylabel=r"$\mathrm{d}N/\mathrm{d}\ln m$",
+ax.set(xlabel=r"clump mass $m$ [$M_\odot$]", ylabel=r"$\mathrm{d}N/\mathrm{d}\ln m$",
        title=f"subhalos of a {h['M']:.1e} Msun host, z = {h['z']:.2f}")
 fig.tight_layout(); plt.show()"""))
 
@@ -395,8 +405,17 @@ same side of the ray have aligned tangential shears, which gives the $m\ge1$ ter
 $$G_m(l) = \int\mathrm d^2R\sum b\,D\,n\;e^{ik_\kappa\kappa}J_m(k_\gamma\gamma)\,J_{2m}(lR),\qquad
 \Psi_2 = \frac12\sum_{\rm nodes}\frac{1}{\Delta\chi}\int\frac{l\,\mathrm dl}{2\pi}P_0(l)\sum_m G_mG_{-m}\quad(m\le2),$$
 with $R$ the comoving distance between the lens centre and the ray. The $l$ integral is a Gauss-Legendre
-rule in $\ln l$ over $[10^{-4}, 10^4]$ Mpc$^{-1}$ (`sgl_full.xi_kperp_grid`). Virial truncation keeps the long-wavelength
-response $B(\boldsymbol k, \boldsymbol 0)$ finite. An untruncated NFW halo has a logarithmically divergent projected mass."""))
+rule in $\ln l$ over $[10^{-4}, 10^4]$ Mpc$^{-1}$ (`sgl_full.xi_kperp_grid`). Truncation keeps the long-wavelength
+response $B(\boldsymbol k, \boldsymbol 0)$ finite. An untruncated NFW halo has a logarithmically divergent projected mass.
+
+**Positive closure (option).** $\Psi_1 + \Psi_2$ is the characteristic function of a Gauss-Poisson process, whose
+random lens intensity $1 + b\,\delta$ is Gaussian and can go negative. Where that happens often (low $z_s$, high
+$\sigma_8$) the inverted PDF can have negative regions. `pipeline.run(..., xi_closure="vp")` (`pos_closure.py`)
+replaces $\Psi_2$ by the characteristic function of a positive random intensity on the same cells: a Markov chain of
+latent states along the line of sight, with each cell's rate rectified so that the mean rates and the $\kappa$ and
+shear clustering variances stay those of $\Psi_2$. It is a valid characteristic function at every $z_s$. For the Planck
+cosmology it removes the negative lobe at the lower edge of the $z_s = 0.5$ PDF (negative mass $1.6\times10^{-5}$
+to $10^{-9}$) and moves the $z_s = 1$ PDF by $10^{-3}$ of the peak, at about three times the cost."""))
 
     c.append(code(r"""xi = F.xi_kperp_grid(cos)
 print(f"xi_lin Limber term: {xi['kp'].size} transverse wavenumbers in "
@@ -517,7 +536,8 @@ The source-plane PDF weights by the area factor $1/\mu$. The $(\kappa,\gamma)$ b
 strong-lensing tail is resolved.
 
 On the log plots, the oscillations below the empty-beam edge (small negative $\ln\mu$) are the numerical floor
-of the Fourier inversion. They stay below about $10^{-5}$ of the peak at $z_s = 1$ and $3\times10^{-5}$ at $z_s = 0.5$. The
+of the Fourier inversion. They stay below about $10^{-7}$ of the peak at $z_s = 1$. At $z_s = 0.5$ the Gaussian
+closure leaves a negative lobe of $4\times10^{-5}$ of the peak there, which the positive closure removes (Sec. 6). The
 real density there is zero: the edge is set by rays with almost no lenses."""))
 
     c.append(code(r"""g = meta["grid"]
@@ -612,18 +632,19 @@ ax[0].legend(fontsize=8); fig.tight_layout(); plt.show()"""))
     c.append(md(r"""## Summary
 
 For a given cosmology and source redshift, the solver returns the source-plane magnification
-distribution of the stochastic lens model (halos with virial truncation, ellipticity, filaments,
+distribution of the stochastic lens model (halos truncated at $r_{200}$, ellipticity, filaments,
 decorated-host subhalos, linear $\xi_{\rm lin}$ clustering). It samples no lens configuration and draws no
 random number: the master equation's solution
 $\ln\Phi_{\rm lens} = \int_0^{z_s}\mathrm dz\,\ell + \Psi_2$ is a deterministic integral over the lens population, and one Hankel-Fourier
-inversion gives $P(\mu)$. One PDF takes about 10-20 s.
+inversion gives $P(\mu)$. One PDF takes about 10-25 s, and about 35-45 s with the positive closure.
 
 **Approximations to keep in mind:**
 - Born approximation (distortions add) and the weak, positive-parity branch of $\mu$;
-- clustering is truncated at the two-point term, with linear bias, $\xi_{\rm lin}$ and Limber;
+- clustering has two-point accuracy, with linear bias, $\xi_{\rm lin}$ and Limber; beyond second order the
+  Gaussian closure (default) and the positive closure (`xi_closure="vp"`) are different models;
 - in the subhalo average the total shear magnitude is replaced by its conditional rms;
-- the model is truncated at $r_{\rm vir}$ and uses $\xi_{\rm lin}$, unlike the engine's untruncated halos and lognormal 1D field. At
-  $z_s\lesssim1$ it is therefore a few per cent narrower than the engine's Monte Carlo by construction.
+- the model is truncated at $r_{200}$ and uses $\xi_{\rm lin}$, unlike the engine's untruncated halos and lognormal 1D field. At
+  $z_s\lesssim1$ it is therefore narrower than the engine's Monte Carlo by construction, increasingly so toward low $z_s$.
 
 **To explore:** edit `config.py` (`ZS`, `COSMO`, `CONFIG`, `ZS_LIST`, `S8_SCAN`, the example lens) and rerun
 `python scripts/build_notebook.py`. To get a single PDF without the notebook:

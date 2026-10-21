@@ -70,7 +70,8 @@ class Cosmology:
                  window="tophat", transfer="nowiggle", conc_model=14,
                  anchor="tophat", pk_mod=None, pk_par=None, Ok=0.0,
                  w0=-1.0, growth_mode="auto", growth_w0=None,
-                 conc_scale=1.0, virial_scale=1.0, wa=0.0, growth_wa=None):
+                 conc_scale=1.0, virial_scale=1.0, wa=0.0, growth_wa=None,
+                 radiation=None, de_rec_cap=1e-2):
         d = DEFAULTS
         self.h = d["h"] if h is None else h
         self.Om = d["Om"] if Om is None else Om
@@ -89,27 +90,47 @@ class Cosmology:
         self.Ok = float(Ok)  # Omega_K > 0 is open; Omega_K < 0 is closed.
         if not np.isfinite(self.Ok):
             raise ValueError("Ok must be finite")
-        self.OL = 1.0 - self.Om - self.Ok
+        # radiation (2026-10-09), the C++ engine's treatment (cpp/cosmology.h,
+        # initialize_normalization): Omega_r = Omega_m/(1+z_eq) with z_eq the free
+        # input, closure Omega_DE = 1 - Omega_m - Omega_r (- Omega_K), and
+        # E^2 = Om (1+z)^3 + Or (1+z)^4 + ... .  radiation=None (default) = no
+        # radiation in the background: every result before 2026-10-09 (bit-identical).
+        if radiation in ("none", False):
+            radiation = None
+        if radiation not in (None, "engine"):
+            raise ValueError('radiation must be None or "engine"')
+        self.radiation = radiation
+        self.Or = (self.Om / (1.0 + self.zeq)) if radiation == "engine" else 0.0
+        self.OL = 1.0 - self.Om - self.Ok - self.Or
         # Smooth CPL dark energy in GR; no radiation/DE perturbations.
         # Separate growth parameters are diagnostic, not physical cosmologies.
         self.w0 = float(w0)
         self.wa = float(wa)
         self.growth_w0 = self.w0 if growth_w0 is None else float(growth_w0)
         self.growth_wa = self.wa if growth_wa is None else float(growth_wa)
-        if not (-2.0 <= self.w0 < -0.3 and -2.0 <= self.growth_w0 < -0.3):
-            raise ValueError("smooth-DE pilot requires -2 <= w0, growth_w0 < -0.3")
+        # Domain (2026-10-12, user; review R4): replaces the old pilot guard
+        # (-2 <= w0 < -0.3, w0 + wa < -0.3, DE/matter < 1e-5 at a = 1e-6), which
+        # cut the planned (w0, wa) box to 52%. Now: w(a -> 0) = w0 + wa < 0 (matter
+        # domination at early times) and DE/matter <= de_rec_cap at z = 1100, so the
+        # EH98 transfer function and the matter-era start of the growth ODE stay
+        # valid. The ODE start needs no tolerance of its own: an initial-data
+        # mismatch only rescales the growing mode (cancels in D(z)/D(0)) or excites
+        # the decaying mode (suppressed by (1e-6/a)^(5/2)); checked against starts
+        # at a = 1e-9 (tmp/training_set/check_de_guard.py).
+        self.de_rec_cap = float(de_rec_cap)
         if not (np.isfinite(self.wa) and np.isfinite(self.growth_wa)):
             raise ValueError("wa and growth_wa must be finite")
         for w0_check, wa_check in ((self.w0, self.wa),
                                    (self.growth_w0, self.growth_wa)):
-            if wa_check != 0.0:
-                if w0_check + wa_check >= -0.3:
-                    raise ValueError("CPL pilot requires w0 + wa < -0.3 for matter-era growth")
-                early_ratio = self.OL / self.Om * exp(
-                    -3 * (w0_check + wa_check) * log(1e-6)
-                    + 3 * wa_check * (1e-6 - 1))
-                if abs(early_ratio) > 1e-5:
-                    raise ValueError("CPL early dark energy exceeds matter-era initialization tolerance")
+            if not (-2.0 <= w0_check <= 1.0):
+                raise ValueError("dark energy requires -2 <= w0, growth_w0 <= 1")
+            if w0_check + wa_check >= 0.0:
+                raise ValueError("dark energy requires w0 + wa < 0 (matter-dominated "
+                                 "early universe)")
+            if self.de_matter_ratio(1100.0, w0_check, wa_check) > self.de_rec_cap:
+                raise ValueError("dark energy exceeds de_rec_cap of the matter density "
+                                 "at z = 1100 (early dark energy: EH98 transfer and "
+                                 "matter-era growth not valid)")
         if growth_mode not in ("auto", "legacy", "ode"):
             raise ValueError("growth_mode must be auto, legacy or ode")
         lambda_de = self.w0 == self.growth_w0 == -1.0 and self.wa == self.growth_wa == 0.0
@@ -151,14 +172,26 @@ class Cosmology:
         z = np.asarray(z, float)
         return self.w0 + self.wa * z / (1 + z)
 
+    def de_matter_ratio(self, z, w0=None, wa=None):
+        """rho_DE / rho_m at z for CPL (w0, wa); defaults to this model's."""
+        w0 = self.w0 if w0 is None else w0
+        wa = self.wa if wa is None else wa
+        z = np.asarray(z, float)
+        return (self.OL / self.Om * (1 + z)**(3 * (w0 + wa))
+                * np.exp(-3 * wa * z / (1 + z)))
+
     def E(self, z):
         if self.w0 == -1.0 and self.wa == 0.0 and self.Ok == 0.0:
+            if self.Or != 0.0:
+                return sqrt(self.Om * (1 + z)**3 + self.Or * (1 + z)**4 + self.OL)
             return sqrt(self.Om * (1 + z)**3 + self.OL)
         zp1 = 1 + np.asarray(z, float)
         if self.wa == 0.0:
             de = self.OL if self.w0 == -1.0 else self.OL * zp1**(3 * (1 + self.w0))
         else:
             de = self.OL * zp1**(3 * (1 + self.w0 + self.wa)) * exp(-3 * self.wa * (1 - 1/zp1))
+        if self.Or != 0.0:
+            return sqrt(self.Om * zp1**3 + self.Or * zp1**4 + self.Ok * zp1**2 + de)
         return sqrt(self.Om * zp1**3 + self.Ok * zp1**2 + de)
 
     def Hz(self, z):
@@ -242,11 +275,17 @@ class Cosmology:
             self._build_growth_ode()
             return
 
+        # The Heath integral is exact for matter + Lambda + curvature only, so it
+        # never carries radiation (radiation="engine" folds Omega_r back into
+        # Lambda here: E(1) = 1; the radiation-aware growths are the ODE and the
+        # CPT fit Dg).  Bit-identical to the old self.OL when Or = 0.
+        OLg = 1.0 - self.Om - self.Ok
+
         def Ea(a):
             if self.Ok == 0.0:
-                return sqrt(self.Om * np.asarray(a, float)**-3 + self.OL)
+                return sqrt(self.Om * np.asarray(a, float)**-3 + OLg)
             a = np.asarray(a, float)
-            return sqrt(self.Om * a**-3 + self.Ok * a**-2 + self.OL)
+            return sqrt(self.Om * a**-3 + self.Ok * a**-2 + OLg)
 
         # a in [1e-6, 1] covers z in [0, 1e6]; the chain never goes above the
         # engine's z_max = 12.34 (a = 0.0749), so this is far outside any use.
@@ -278,17 +317,28 @@ class Cosmology:
         w = self.growth_w0
         wa = self.growth_wa
         x0 = log(1e-6)
+        Or = self.Or
+
         def rhs(x, y):
             matter = self.Om * exp(-3 * x)
             a = exp(x)
             de = self.OL * exp(-3 * (1 + w + wa) * x + 3 * wa * (a - 1))
             wz = w + wa * (1 - a)
             curvature = self.Ok * exp(-2 * x)
-            total = matter + curvature + de
+            if Or != 0.0:
+                rad = Or * exp(-4 * x)
+                total = matter + rad + curvature + de
+                dh = -0.5 * (3 * matter + 4 * rad + 2 * curvature + 3 * (1 + wz) * de) / total
+            else:
+                total = matter + curvature + de
+                dh = -0.5 * (3 * matter + 2 * curvature + 3 * (1 + wz) * de) / total
             om = matter / total
-            dh = -0.5 * (3 * matter + 2 * curvature + 3 * (1 + wz) * de) / total
             return (y[1], -(2 + dh) * y[1] + 1.5 * om * y[0])
-        sol = solve_ivp(rhs, (x0, 0.0), (exp(x0), exp(x0)), method="DOP853",
+        # matter-era growing mode D = a; with radiation the Meszaros growing mode
+        # of matter + radiation, D = a + (2/3) a_eq (a_eq = Or/Om), same D/a -> 1
+        # normalisation for a >> a_eq (primordial_growth_amplitude unchanged).
+        d0 = exp(x0) + ((2.0 / 3.0) * Or / self.Om if Or != 0.0 else 0.0)
+        sol = solve_ivp(rhs, (x0, 0.0), (d0, exp(x0)), method="DOP853",
                         rtol=2e-10, atol=1e-14, dense_output=True)
         if not sol.success:
             raise RuntimeError("dark-energy growth integration failed: " + sol.message)
@@ -302,6 +352,19 @@ class Cosmology:
         return self._D0 if self.growth_mode == "ode" else self._D0 * (2.5 * self.Om)
 
     def D(self, z):
+        # scalar memo (2026-10-16): the build calls D 4e5 times at a few thousand
+        # distinct node redshifts (sgl_full.Dg per host); each ODE dense-output call
+        # costs ~12 us. Same arithmetic, so results are bit-identical.
+        if np.ndim(z) == 0:
+            cache = self.__dict__.setdefault("_D_memo", {})
+            zf = float(z)
+            v = cache.get(zf)
+            if v is None:
+                v = cache[zf] = self._D_eval(zf)
+            return v
+        return self._D_eval(z)
+
+    def _D_eval(self, z):
         a = 1.0 / (1 + np.asarray(z, float))
         if self.growth_mode == "ode":
             if np.any((a < self._a_growth_range[0]) | (a > 1)):
@@ -812,7 +875,8 @@ def _cosmology_kwargs(cos):
                 pk_par=dict(getattr(cos, "pk_par", {}) or {}),
                 w0=cos.w0, growth_w0=cos.growth_w0, growth_mode=cos.growth_mode,
                 wa=cos.wa, growth_wa=cos.growth_wa,
-                conc_scale=cos.conc_scale, virial_scale=cos.virial_scale)
+                conc_scale=cos.conc_scale, virial_scale=cos.virial_scale,
+                radiation=cos.radiation)
 
 
 def _R_of_xi_zchunk(payload):
@@ -1114,8 +1178,11 @@ PHI_TOL = 1e-10         # |Phi| at the k-space cut; sets the Gibbs ringing floor
 PPP_K = 18.0            # quadrature points per period of exp(-i k_k kappa)
 PPP_G = 96.0            # quadrature points per period of J0(k_g gamma)
 BOX_REACH = 6.0         # (kappa, gamma) box half-extent, in sigma
-PTS_PER_SIG_KAP = 24.0  # kappa-grid resolution
-PTS_PER_SIG_GAM = 12.0  # gamma-grid resolution
+# x3 (2026-10-16, user, resolution study experiments/resolution_study/): with 24 / 12 the bilinear
+# (kappa, gamma) interpolant behind each ln mu path biased the PDF by 0.34% of peak (z_s >= 3) to
+# 3-6.5% (z_s 0.5-0.67, high s8); 72 / 36 with n_k_int 2400 brings it to ~1e-4 in variance.
+PTS_PER_SIG_KAP = 72.0  # kappa-grid resolution (was 24)
+PTS_PER_SIG_GAM = 36.0  # gamma-grid resolution (was 12)
 XI_REACH = 24.0         # moment/normalization grid reach, in sigma_xi = 2 sigma
 # ^ 24 not 8: the magnification tail carries negligible MASS but a large share
 #   of the MOMENTS.  At z_s=5 a reach of 8 cuts only 7.5e-5 of the probability

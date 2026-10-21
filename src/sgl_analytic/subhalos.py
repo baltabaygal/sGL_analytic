@@ -363,10 +363,15 @@ def _mu(y):
 def _Om_z(cos, z):
     a3 = cos.Om * (1 + z)**3
     if (getattr(cos, "Ok", 0.0) != 0.0 or getattr(cos, "w0", -1.0) != -1.0
-            or getattr(cos, "wa", 0.0) != 0.0):
+            or getattr(cos, "wa", 0.0) != 0.0 or getattr(cos, "Or", 0.0) != 0.0):
         return a3 / cos.E(z)**2
     return a3 / (a3 + cos.OL)
 
+
+# z_f solve in SubhaloModel.fs: Brent (2026-10-16); env SGL_FS_BISECTION=1 restores the original 60-step
+# bisection (an env var so spawned build workers see it too)
+import os as _os_fs
+FS_BRENT = _os_fs.environ.get("SGL_FS_BISECTION") is None
 
 def _Dvir(cos, z):
     # BN LambdaCDM fit evaluated at instantaneous Omega_m(z): an explicit
@@ -451,6 +456,17 @@ if _HAVE_NUMBA:
         return Rh, n3
 
 
+def _frac_inside(xa, xb, C_, x0, n=4096):
+    """Fraction of the 3D clump profile dN/dx ~ x B(x)/(1+cx)^2 on [0, xb]
+    that lies in [0, xa] (x = r/r200); for clump_edge="r200" (2026-10-12).
+    Midpoint rule, smooth integrand (B ~ (x/x0)^1.25 at x -> 0): ~1e-8."""
+    def mass(xm):
+        x = (np.arange(n) + 0.5) * (xm / n)
+        B = 1.0 / np.sqrt((x / x0)**-BIAS_EXP + 1.0)
+        return np.sum(x * B / (1.0 + C_ * x)**2) * (xm / n)
+    return mass(xa) / mass(xb)
+
+
 def _eta(cos, c, z):
     if _HAVE_NUMBA:
         return _eta_scalar_nb(float(c), float(_Dvir(cos, z)))
@@ -524,8 +540,28 @@ def cos_zs_dummy(cos, z):
 class SubhaloModel:
     def __init__(self, cos, zs, kthr, Mhost_min=1e9, npsi=28, nd=90, nth=48,
                  split=10.0, ntheta=4, nr=40, prune=0.0, pair_angle="uniform",
-                 sector="pairs", exact_kw=None, clump_edge="kthr", clump_mass="vir"):
+                 sector="pairs", exact_kw=None, clump_edge="kthr", clump_mass="vir",
+                 clump_shape="circular", nphi_c=12):
         self.cos, self.zs, self.kthr = cos, zs, kthr
+        # Clump shape (2026-10-13, user: subhalos pseudo-elliptical like their
+        # hosts, averaged over their orientation):
+        #   "circular": circular truncated NFW (the engine's clump; bit-identical
+        #       to the pre-option code);
+        #   "elliptical": the field halos' pseudo-elliptical NFW
+        #       (sgl_full.kappagamma_eps, engine cos^2 form) with eps(m, z) from
+        #       the same Allgood+06 relation at the clump's M200, truncated at the
+        #       clump edge in the elliptical radius; the orientation angle is
+        #       uniform, averaged on nphi_c midpoint nodes in [0, pi/2] (as
+        #       nphi for the field halos).  A clump covers the ray (and is carved
+        #       from the host) iff the ray is inside its elliptical edge, so its
+        #       reach is D = x_t r_s / sqrt(1 - eps).  Exact sector, truncated
+        #       clumps only.  NB a pseudo-elliptical lens carries 1/sqrt(1-eps^2)
+        #       times the projected mass of its circular parent.
+        if clump_shape not in ("circular", "elliptical"):
+            raise ValueError(f"clump_shape must be 'circular' or 'elliptical', not {clump_shape!r}")
+        if clump_shape == "elliptical" and (sector != "exact" or clump_edge not in ("rvir", "r200")):
+            raise ValueError('clump_shape="elliptical" needs sector="exact", clump_edge="rvir" or "r200"')
+        self.clump_shape, self.nphi_c = clump_shape, int(nphi_c)
         # Clump mass definition (2026-10-05, user: the consistent choice), used
         # with clump_edge="rvir":
         #   "vir": m = psi M_vir is the clump's VIRIAL mass: its NFW is built at
@@ -543,15 +579,25 @@ class SubhaloModel:
         #       (sgl_full.nfw_trunc_kg), rendered when the ray passes inside it
         #       (D = r_vir of the clump): no kthr anywhere in the clump law.
         #       Exact sector only (the pairs sector also needs ksplit).
-        if clump_edge not in ("kthr", "rvir"):
-            raise ValueError(f"clump_edge must be 'kthr' or 'rvir', not {clump_edge!r}")
-        if clump_edge == "rvir" and sector != "exact":
-            raise ValueError('clump_edge="rvir" needs sector="exact"')
+        #   "r200" (2026-10-12, user, review R1 option 1): the r200c convention,
+        #       for hosts truncated at r200c (build_population trunc="r200").  The
+        #       calibrated population (JvdB psi = m/M_vir, f_s, Green+21 radial
+        #       profile with x0 = 0.86 r_vir) is used unchanged and SELECTED to
+        #       3D host radius r <= r200: dN x F_in (fraction of the profile
+        #       inside r200), projected over the r200 sphere.  Each clump is an
+        #       NFW with M200 = m truncated at its own r200 (encloses exactly m;
+        #       clump_mass is ignored); the host loses S = sum m (carve v_r = 1,
+        #       since the r200-truncated host encloses exactly M).  Delta_vir
+        #       survives only inside the calibrated fit (psi, f_s, x0, eta).
+        if clump_edge not in ("kthr", "rvir", "r200"):
+            raise ValueError(f"clump_edge must be 'kthr', 'rvir' or 'r200', not {clump_edge!r}")
+        if clump_edge in ("rvir", "r200") and sector != "exact":
+            raise ValueError(f'clump_edge="{clump_edge}" needs sector="exact"')
         # kthr (2026-10-02) enters only through ksplit (pairs sector) and the
         # clump reach ksub (clump_edge "kthr"); the default exact + "rvir"
         # model takes kthr=None and has no threshold anywhere
-        if kthr is None and clump_edge != "rvir":
-            raise ValueError('kthr=None needs sector="exact", clump_edge="rvir"')
+        if kthr is None and clump_edge == "kthr":
+            raise ValueError('kthr=None needs sector="exact", clump_edge="rvir" or "r200"')
         self.clump_edge = clump_edge
         if pair_angle not in ("uniform", "engine"):
             raise ValueError(f"pair_angle must be 'uniform' or 'engine', not {pair_angle!r}")
@@ -572,7 +618,8 @@ class SubhaloModel:
                              split=split, ntheta=ntheta, nr=nr, prune=prune,
                              pair_angle=pair_angle, sector=sector,
                              exact_kw=dict(exact_kw or {}), clump_edge=clump_edge,
-                             clump_mass=clump_mass)
+                             clump_mass=clump_mass, clump_shape=clump_shape,
+                             nphi_c=int(nphi_c))
         # pair-sector resolution (defaults = the validated 2026-09-24 setting)
         self.ntheta, self.nr = ntheta, nr
         # Relative angle theta between the host->ray and clump->ray directions
@@ -632,14 +679,23 @@ class SubhaloModel:
         rhs = dcz + self.wf * sqrt(ds2)
         if F.DC0 / F.Dg(cos, 30.0) < rhs:
             return 0.0
-        lo, hi = z, 30.0
-        for _ in range(60):
-            zm = 0.5 * (lo + hi)
-            if F.DC0 / F.Dg(cos, zm) < rhs:
-                lo = zm
-            else:
-                hi = zm
-        zf = 0.5 * (lo + hi)
+        if FS_BRENT:
+            # Brent root of delta_c(z_f) = rhs (2026-10-16): the same monotone function as
+            # the 60-step bisection below, ~10 growth-ODE evaluations instead of 60 (the
+            # bisection was 258k ODE calls / 6% of the z_s=1 build). Root to machine
+            # precision -> roundoff-level change (gate: tmp/perf/gate_build.py).
+            from scipy.optimize import brentq
+            zf = brentq(lambda zz: F.DC0 / F.Dg(cos, zz) - rhs, z, 30.0,
+                        xtol=1e-15, rtol=8.9e-16, maxiter=200)
+        else:
+            lo, hi = z, 30.0
+            for _ in range(60):
+                zm = 0.5 * (lo + hi)
+                if F.DC0 / F.Dg(cos, zm) < rhs:
+                    lo = zm
+                else:
+                    hi = zm
+            zf = 0.5 * (lo + hi)
         zz = z + (np.arange(200) + 0.5) * (zf - z) / 200
         Ntau = np.sum(6.006 * sqrt(_Dvir(cos, zz) / 178.0)
                       / (1 + zz)) * (zf - z) / 200
@@ -678,24 +734,38 @@ class SubhaloModel:
                 if self.clump_edge == "rvir":
                     xtc = _eta_vec(cos, Cc, z) * Cc                # clump r_vir / r_s
                     D = xtc * rsc
+                elif self.clump_edge == "r200":
+                    xtc = Cc.copy()                                # clump r200 / r_s (M200 = m)
+                    D = xtc * rsc
                 else:
                     xtc = None
                     D = F._xmax_for_vec(ksc, self.ksub) * rsc   # bit-equal to the per-k loop
-                # projected, normalised clump number density per area n(R)
+                epsc = None
+                if self.clump_shape == "elliptical":
+                    # reach of the elliptical edge x_eps = x_t: along the major axis
+                    epsc = F.epsilon_NFW_vec(cos, m200c, z)
+                    D = D / sqrt(1.0 - epsc)
+                # projected, normalised clump number density per area n(R),
+                # out to the host edge xe (r_vir; r200 for clump_edge "r200")
                 x0 = X0_RVIR * eta
+                vr = Mvir / M
+                xe = eta
+                if self.clump_edge == "r200":
+                    xe, vr = 1.0, 1.0
+                    dN = dN * _frac_inside(1.0, eta, C_, x0)
                 if _HAVE_NUMBA and BIAS_EXP == 2.5:
-                    Rh, n3 = _n3_proj_nb(float(eta), float(C_), float(x0))
+                    Rh, n3 = _n3_proj_nb(float(xe), float(C_), float(x0))
                 else:
-                    Rh = (np.arange(256) + 0.5) / 256 * eta
+                    Rh = (np.arange(256) + 0.5) / 256 * xe
                     u = np.linspace(0, 1, 160)
-                    umax = sqrt(np.maximum(eta**2 - Rh**2, 0))
+                    umax = sqrt(np.maximum(xe**2 - Rh**2, 0))
                     X = sqrt(Rh[:, None]**2 + (u[None, :] * umax[:, None])**2)
                     B = 1 / sqrt((X / x0)**-BIAS_EXP + 1)
                     p3 = X / (1 + C_ * X)**2 * B / X**2           # rho_NFW B (per vol)
                     n3 = np.trapezoid(p3, u, axis=1) * umax * 2  # line-of-sight integral
                 n2 = n3 / np.trapezoid(n3 * 2 * pi * Rh, Rh)  # per unit Rhat^2
-                out = dict(M=M, z=z, r200=r200, eta=eta, vr=Mvir / M, f=f,
-                           dN=dN, m=m, rsc=rsc, ksc=ksc, D=D, xtc=xtc,
+                out = dict(M=M, z=z, r200=r200, eta=eta, vr=vr, f=f,
+                           dN=dN, m=m, rsc=rsc, ksc=ksc, D=D, xtc=xtc, epsc=epsc,
                            Rn=Rh * r200, n2=n2 / r200**2, rs=rs, ks=ks)
                 self.stats["fsub_mass"].append(float(np.sum(dN * m) / Mvir))
         self._cache[key] = out

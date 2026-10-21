@@ -5,7 +5,7 @@
   python run_pdf.py --zs 3 --s8 0.75 --Om 0.30 --out output/pdf_zs3_s8lo.json
   python run_pdf.py --zs 1 --Ok 0.05 --out output/pdf_zs1_open.json
   python run_pdf.py --zs 1 --wa 0.3 --out output/pdf_zs1_cpl.json
-  python run_pdf.py --zs 1 --growth-mode ode --out output/pdf_zs1_lcdm_ode.json
+  python run_pdf.py --zs 0.3 --closure vp --out output/pdf_zs0.3_vp.json
 
 Writes JSON with xi = ln mu on [-1, 1] and P_s = source-plane dP/d ln mu there,
 xi_tail / P_s_tail on (1, 9] (same normalisation), plus moments and timings.
@@ -37,8 +37,14 @@ def main(argv=None):
     ap.add_argument("--wa", type=float, default=EXTENSIONS["wa"], help="CPL slope (default 0)")
     ap.add_argument("--growth-mode", "--growth_mode", dest="growth_mode",
                     choices=("auto", "ode", "legacy"), default=EXTENSIONS["growth_mode"],
-                    help='growth: "auto" (historical for Lambda, ODE otherwise) or "ode" '
-                         '(ODE for every model; use it for a Lambda reference)')
+                    help='growth: "ode" (default, GR growth ODE for every model) or "auto" '
+                         '(historical for Lambda, ODE otherwise)')
+    ap.add_argument("--radiation", choices=("engine", "none"), default=EXTENSIONS["radiation"],
+                    help='"engine" (default): Omega_r = Om/(1+zeq) in the background; '
+                         '"none": no radiation')
+    ap.add_argument("--closure", choices=("gauss", "vp"), default="gauss",
+                    help='clustering closure: "gauss" (default, Gauss-Poisson pair term) or '
+                         '"vp" (positive Cox closure, valid at every z_s; slower)')
     ap.add_argument("--config", default="full",
                     help='lens model: "full" (default), "halo", "+ell", "-sub", ... '
                          '(pass minus arms as --config=-sub)')
@@ -50,8 +56,9 @@ def main(argv=None):
     try:
         out, _ = run(a.zs, a.config, nproc=a.nproc,
                      cosmo=dict(h=a.h, Om=a.Om, s8=a.s8, Ob=a.Ob, ns=a.ns, zeq=a.zeq,
-                                Ok=a.Ok, w0=a.w0, wa=a.wa, growth_mode=a.growth_mode),
-                     xi_out=np.linspace(-1.0, 1.0, 1601),
+                                Ok=a.Ok, w0=a.w0, wa=a.wa, growth_mode=a.growth_mode,
+                                radiation=a.radiation),
+                     xi_closure=a.closure, xi_out=np.linspace(-1.0, 1.0, 1601),
                      xi_tail=np.linspace(1.005, 9.0, 1600))
     except ValueError as exc:
         ap.error(str(exc))

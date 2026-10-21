@@ -44,11 +44,11 @@ solver of this repository for any source redshift, cosmology and lens model you 
 **How to use:** edit the **knobs** cell below and *Run All*. Each PDF takes about 10-25 s. Results are
 cached within a session, so re-running a plot cell or adding one redshift only computes what is new.
 
-**The model:** NFW field halos (Sheth-Tormen abundance, Ludlow+16 concentrations) truncated at their
-virial radii, pseudo-elliptical projections, filaments, subhalos (exact decorated-host quadrature), and
+**The model:** NFW field halos (Sheth-Tormen abundance, Ludlow+16 concentrations) truncated at
+$r_{200}$, pseudo-elliptical projections, filaments, subhalos (exact decorated-host quadrature), and
 linear-bias clustering with the 3D linear correlation function (Limber). The lens population follows
 Vaskonen (2026) and FLUMEN (Baltabay et al. 2026). It differs from their Monte Carlo engine in two
-places: the virial truncation and the $\xi_{\rm lin}$ clustering. The derivation of each stage is in
+places: the $r_{200}$ truncation and the $\xi_{\rm lin}$ clustering. The derivation of each stage is in
 `notebooks/sgl_analytic_walkthrough.ipynb`.
 
 **Outputs:** the PDF on linear and log scales with the strong-lensing tail, tail probabilities
@@ -74,22 +74,23 @@ while not (REPO / "src" / "pipeline.py").is_file():
 ZS = [0.5, 1.0, 3.0, 10.0]
 
 # Cosmologies to compare, name -> parameters. Allowed keys: h, Om, sigma8 (or s8), Ob, ns, zeq,
-# Ok, w0, wa, growth_mode. Omitted keys take Planck 2018: h=0.674, Om=0.315, s8=0.811, Ob=0.0493,
-# ns=0.965, zeq=3402.0, flat (Ok=0) with a cosmological constant (w0=-1, wa=0).
+# Ok, w0, wa, growth_mode, radiation. Omitted keys take Planck 2018: h=0.674, Om=0.315, s8=0.811,
+# Ob=0.0493, ns=0.965, zeq=3402.0, flat (Ok=0) with a cosmological constant (w0=-1, wa=0), the
+# growth ODE (growth_mode="ode") and radiation Omega_r = Om/(1+zeq) (radiation="engine"; None = off).
 # s8 is a real-space top-hat sigma_8. Ok > 0 is open; dark energy has w(a) = w0 + wa (1 - a).
-# To compare a w0/wa model with LCDM, give BOTH growth_mode="ode" (e.g. dict(growth_mode="ode")
-# and dict(wa=0.3, growth_mode="ode")): the default "auto" keeps the historical growth for Lambda.
 # The FIRST entry is the reference of the ratio plots.
 COSMOLOGIES = {
     "Planck 2018":   dict(),
     "sigma_8 = 0.87": dict(s8=0.87),
 }
 
-# Lens model: spherical NFW halos truncated at r_vir, plus
+# Lens model: spherical NFW halos truncated at r200, plus
 ELLIPTICITY = True    # pseudo-elliptical projections (Allgood+06 axis ratios)
 FILAMENTS   = True    # cylindrical filaments, flat-barrier mass function
 SUBHALOS    = True    # subhalos on their hosts, host mass reduced accordingly
 CLUSTERING  = True    # linear-bias two-point term with xi_lin (Limber)
+CLOSURE     = "gauss" # clustering closure: "gauss" (Gauss-Poisson) or "vp" (positive Cox closure,
+                      # valid at every z_s, about 3x slower; use it below z_s ~ 0.5)
 
 # Ingredient ladder at one z_s with the reference cosmology:
 # halo -> +ellipticity -> +filaments -> +subhalos -> +clustering.  None = skip.
@@ -127,10 +128,11 @@ _CACHE = globals().setdefault("_CACHE", {})
 
 def pdf(zs, cosmo, model=MODEL):
     # one PDF from pipeline.run, cached on every input that changes it
-    key = (float(zs), tuple(sorted(cosmo.items())), model, tuple(sorted(NUMERICS.items())))
+    closure = CLOSURE if "bias" in model else "gauss"    # the closure acts on clustering only
+    key = (float(zs), tuple(sorted(cosmo.items())), model, closure, tuple(sorted(NUMERICS.items())))
     if key not in _CACHE:
         o, _ = pipeline.run(float(zs), set(model), cosmo=cosmo, nproc=NPROC,
-                            xi_out=XI_BODY, xi_tail=XI_TAIL, **NUMERICS)
+                            xi_out=XI_BODY, xi_tail=XI_TAIL, xi_closure=closure, **NUMERICS)
         x = np.r_[o["xi"], o["xi_tail"]]
         Ps = np.r_[o["P_s"], o["P_s_tail"]]
         o["x"], o["P_S"], o["P_I"] = x, Ps, pipeline.to_image_plane(x, Ps)
@@ -142,8 +144,8 @@ def P_of(o):
     return o["P_S"] if PLANE == "source" else o["P_I"]
 
 YLAB = r"$\mathrm{d}P_S/\mathrm{d}\ln\mu$" if PLANE == "source" else r"$\mathrm{d}P_I/\mathrm{d}\ln\mu$"
-print(f"lens model: {pipeline.cfg_name(MODEL)};  plane: {PLANE};  cosmologies: {list(COSMOLOGIES)};  "
-      f"z_s: {ZS}")
+print(f"lens model: {pipeline.cfg_name(MODEL)};  closure: {CLOSURE};  plane: {PLANE};  "
+      f"cosmologies: {list(COSMOLOGIES)};  z_s: {ZS}")
 t0 = time.time()
 R = {(name, zs): pdf(zs, cp) for name, cp in COSMOLOGIES.items() for zs in ZS}
 print(f"{len(R)} PDFs ready in {time.time() - t0:.0f} s")"""))
@@ -313,12 +315,13 @@ else:
                    header="ln_mu,dPS_dlnmu,dPI_dlnmu", comments="")
         files.append(f.name)
     summary = dict(knobs=dict(ZS=ZS, COSMOLOGIES=COSMOLOGIES, model=pipeline.cfg_name(MODEL),
-                              NUMERICS=NUMERICS),
+                              CLOSURE=CLOSURE, NUMERICS=NUMERICS),
                    results=[{"cosmology": k[0], "z_s": k[1],
                              **{c_: (float(v) if np.ndim(v) == 0 else v) for c_, v in row.items()}}
                             for k, row in table.to_dict("index").items()],
                    cosmology_resolved={name: {p: R[(name, ZS[0])][p] for p in ("h", "Om", "sigma8", "Ob", "ns", "zeq",
-                                                                     "Ok", "w0", "wa", "growth_mode")}
+                                                                     "Ok", "w0", "wa", "growth_mode",
+                                                                     "radiation")}
                                        for name in COSMOLOGIES})
     (SAVE_DIR / "summary.json").write_text(json.dumps(summary, indent=1))
     print(f"wrote {len(files)} CSV files + summary.json to {SAVE_DIR}")"""))

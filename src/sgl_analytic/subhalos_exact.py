@@ -1304,6 +1304,73 @@ if _HAVE_NUMBA:
         return I_arr, Dd_arr, Kc_arr, Gc_arr, m_arr, pref_arr
 
     @_numba.njit(cache=True)
+    def _clump_cells_kernel_eps(dc, dA, D, rsc, ksc, xtc, epsc, m, dN, vr, phis, gx, gw):
+        """Pseudo-elliptical truncated clumps (clump_shape="elliptical",
+        2026-10-13): one cell per (mass bin i, orientation node l, ray-distance
+        cell d) INSIDE the elliptical edge x_eps < x_t, rate dN dA / nphi.
+        kappa, |gamma| as F.kappagamma_eps (engine cos^2 form, max(0,.) clamp);
+        the same operations as the host kernels (_moments_fused_*)."""
+        nm = D.shape[0]
+        nd = dc.shape[0]
+        nph = phis.shape[0]
+        tot = 0
+        for i in range(nm):
+            sa = _math.sqrt(max(1.0 - epsc[i], 0.0))
+            sb = _math.sqrt(1.0 + epsc[i])
+            for l in range(nph):
+                cp, sp = _math.cos(phis[l]), _math.sin(phis[l])
+                fac = _math.sqrt((sa * cp) ** 2 + (sb * sp) ** 2)
+                for d in range(nd):
+                    if dc[d] >= D[i]:
+                        break
+                    if fac * dc[d] / rsc[i] < xtc[i]:
+                        tot += 1
+        I_arr = np.empty(tot, dtype=np.int64)
+        Dd_arr = np.empty(tot, dtype=np.int64)
+        Kc_arr = np.empty(tot)
+        Gc_arr = np.empty(tot)
+        m_arr = np.empty(tot)
+        pref_arr = np.empty(tot)
+        o = 0
+        for i in range(nm):
+            rsi, ksi, xti, ep = rsc[i], ksc[i], xtc[i], epsc[i]
+            sa = _math.sqrt(max(1.0 - ep, 0.0))
+            sb = _math.sqrt(1.0 + ep)
+            mi = m[i] / vr
+            for l in range(nph):
+                cp, sp = _math.cos(phis[l]), _math.sin(phis[l])
+                for d in range(nd):
+                    dcd = dc[d]
+                    if dcd >= D[i]:
+                        break
+                    x = dcd / rsi
+                    x1 = sa * cp * x
+                    x2 = sb * sp * x
+                    xe2 = x1 * x1 + x2 * x2
+                    x_ell = _math.sqrt(xe2)
+                    if x_ell < 1e-12:
+                        x_ell = 1e-12
+                    if x_ell >= xti:
+                        continue
+                    c2 = (x1 * x1 - x2 * x2) / (xe2 if xe2 > 1e-300 else 1e-300)
+                    ku, gu = _kg_unit_scalar(x_ell)
+                    I1, I2 = _tc_scalar(x_ell, xti, gx, gw)
+                    k1 = ku - 2.0 * I1
+                    g1 = (ku + gu - 4.0 * I2) - k1
+                    k0 = k1 * ksi
+                    g0 = ksi if x_ell < 1e-4 else g1 * ksi
+                    cg = c2 * g0
+                    g2 = g0 * g0 + 2.0 * ep * cg * k0 + ep * ep * (k0 * k0 - cg * cg)
+                    I_arr[o] = i
+                    Dd_arr[o] = d
+                    Kc_arr[o] = k0 + ep * cg
+                    Gc_arr[o] = _math.sqrt(g2) if g2 > 0.0 else 0.0
+                    m_arr[o] = mi
+                    pref_arr[o] = dN[i] * dA[d] / nph
+                    o += 1
+        return I_arr, Dd_arr, Kc_arr, Gc_arr, m_arr, pref_arr
+
+    @_numba.njit(cache=True)
     def _bulk_moments_accum(d, bulk, pref, k, mh, g, nd):
         Q = np.zeros((nd, 16))
         nc = d.shape[0]
@@ -1487,6 +1554,35 @@ class ExactSector:
         if "_clump_cells" in h:
             return h["_clump_cells"]
         de, dc, dA = self.sub._dgrid(h)
+        if h.get("epsc") is not None:                  # clump_shape="elliptical"
+            nph = self.sub.nphi_c
+            phis = (np.arange(nph) + 0.5) * (0.5 * np.pi / nph)
+            if _HAVE_NUMBA:
+                gx, gw = np.array(F._GLX, dtype=float), np.array(F._GLW, dtype=float)
+                c64 = lambda a: np.ascontiguousarray(a, dtype=float)
+                I, Dd, Kc, Gc, mc, pref = _clump_cells_kernel_eps(
+                    c64(dc), c64(dA), c64(h["D"]), c64(h["rsc"]), c64(h["ksc"]), c64(h["xtc"]),
+                    c64(h["epsc"]), c64(h["m"]), c64(h["dN"]), float(h["vr"]), phis, gx, gw)
+            else:
+                I, Dd, Kc, Gc, pref = [], [], [], [], []
+                for i in range(len(h["m"])):
+                    for ph in phis:
+                        sel = np.nonzero(dc < h["D"][i])[0]
+                        x = dc[sel] / h["rsc"][i]
+                        ep = h["epsc"][i]
+                        xel = x * sqrt((1 - ep) * np.cos(ph)**2 + (1 + ep) * np.sin(ph)**2)
+                        sel, x = sel[xel < h["xtc"][i]], x[xel < h["xtc"][i]]
+                        k_, g_ = F.kappagamma_eps(ep, h["ksc"][i], x, np.full(x.size, ph), xt=h["xtc"][i])
+                        I.append(np.full(sel.size, i)); Dd.append(sel); Kc.append(k_); Gc.append(g_)
+                        pref.append(h["dN"][i] * dA[sel] / nph)
+                I, Dd, Kc, Gc, pref = (np.concatenate(a) for a in (I, Dd, Kc, Gc, pref))
+                mc = h["m"][I] / h["vr"]
+            if not I.size:
+                h["_clump_cells"] = None
+                return None
+            res = dict(i=I, d=Dd, k=Kc, g=Gc, m=mc, pref=pref, dc=dc)
+            h["_clump_cells"] = res
+            return res
         if _HAVE_NUMBA:
             gx, gw = np.array(F._GLX, dtype=float), np.array(F._GLW, dtype=float)
             xtc = np.ascontiguousarray(h["xtc"], dtype=float) if h.get("xtc") is not None else np.zeros(0, dtype=float)
@@ -1542,12 +1638,10 @@ class ExactSector:
 
     def host_cells(self, jz, jM, xref, Wref, xcell, Wcell, phicell=None, eps=None, xt=None):
         """xt (2026-10-02): host truncated at x_t = r_t / r_s (fixed physical
-        edge r_t, kept for the rebuilt host); moments method only."""
+        edge r_t, kept for the rebuilt host in both evaluation methods)."""
         if self.method == "moments":
             return self.host_cells_moments(jz, jM, xref, Wref, xcell, Wcell, phicell, xt)
-        if xt is not None:
-            raise NotImplementedError("truncated hosts need method='moments'")
-        return self.host_cells_lattice(jz, jM, xref, Wref, xcell, Wcell, phicell)
+        return self.host_cells_lattice(jz, jM, xref, Wref, xcell, Wcell, phicell, xt)
 
     # ------------------------------------------------------------------
     def host_cells_moments(self, jz, jM, xref, Wref, xcell, Wcell, phicell=None, xt=None):
@@ -1746,9 +1840,12 @@ class ExactSector:
                     ep_zero,
                     float(M), float(self.Mmin), gx, gw)
             else:
-                nph = 12
+                # number of phi rows: was hard-coded 12, so nphi = 24, 36, ... passed the
+                # layout test and took the WRONG angles (resolution study 2026-10-16: nphi 24
+                # gave 1.3% in variance instead of 0.4%). Infer it from the angles.
+                nph = int(np.unique(phicell).size)
                 is_uniform = False
-                if xcell.size % nph == 0:
+                if nph > 0 and xcell.size % nph == 0:
                     nr = xcell.size // nph
                     if np.all(xcell.reshape(nph, nr) == xcell[:nr]) and np.all(Wcell.reshape(nph, nr) == Wcell[:nr]):
                         is_uniform = True
@@ -1833,7 +1930,7 @@ class ExactSector:
         self.stats["points"] += int(Ko.size)
         return Ko, Go, Wo
 
-    def host_cells_lattice(self, jz, jM, xref, Wref, xcell, Wcell, phicell=None):
+    def host_cells_lattice(self, jz, jM, xref, Wref, xcell, Wcell, phicell=None, xt=None):
         """Cells (K, G, W) of the decorated host.
         xref, Wref: the circular reference grid (r/rs, weights) defining the
         groups and the group-averaged clump law; xcell, Wcell[, phicell]: the
@@ -1891,10 +1988,15 @@ class ExactSector:
         for t, s in enumerate(St):
             Me = max(h["M"] - s, self.Mmin)
             C_, rs_t, ks_t, fC = cos.nfw_params(Me, z, zs)
+            # Keep the original physical host edge while rebuilding its mass.
+            xt_eff = None if xt is None else xt * rs / rs_t
             if phicell is None:
-                k_, g_ = sgl.kappa_gamma(np.ascontiguousarray(rcell / rs_t), ks_t)
+                k_, g_ = _kg_unit(rcell / rs_t, None if xt_eff is None
+                                 else np.full_like(rcell, xt_eff))
+                k_, g_ = k_ * ks_t, g_ * ks_t
             else:
-                k_, g_ = F.kappagamma_eps(F.epsilon_NFW(cos, Me, z), ks_t, rcell / rs_t, phicell)
+                k_, g_ = F.kappagamma_eps(F.epsilon_NFW(cos, Me, z), ks_t,
+                                        rcell / rs_t, phicell, xt_eff)
             tk[:, t], tg[:, t] = k_, g_
         # cell -> group by r (elliptical cells: nearest reference r)
         cg = gid_ref[np.clip(np.searchsorted(xref, xcell), 0, xref.size - 1)]

@@ -8,14 +8,9 @@ Config strings: "full" (default), "halo", "+ell", "+fil", "+sub", "+bias", "-<x>
 """
 from __future__ import annotations
 
-import argparse
 import inspect
-import os
-import json
-import sys
 import time
 import warnings
-from pathlib import Path
 
 import numpy as np
 
@@ -23,22 +18,25 @@ from . import sgl
 from . import sgl_full as F
 
 P = dict(h=0.674, Om=0.315, s8=0.811, Ob=0.0493, ns=0.965, zeq=3402.0)
-# Curvature and CPL dark energy (2026-10-06). Kept out of P on purpose: P is
+# Curvature, CPL dark energy, growth and radiation. Kept out of P on purpose: P is
 # the Planck LCDM reference that config.COSMO and the stored PDFs refer to.
-#   Ok: Omega_K (> 0 open, < 0 closed); Omega_DE = 1 - Om - Ok.
+#   Ok: Omega_K (> 0 open, < 0 closed); Omega_DE = 1 - Om - Or - Ok.
 #   w0, wa: w(a) = w0 + wa (1 - a); (-1, 0) is a cosmological constant.
-#   growth_mode: "auto" = the historical LCDM growth for any Lambda model
-#     (exact integral for sigma(M), Carroll-Press-Turner in bias and M*) and
-#     the GR growth ODE otherwise; "ode" = the ODE for every model, including
-#     Lambda. "auto" therefore jumps at w = -1 (1.9e-4 in the z_s = 1 clipped
-#     variance): compare a w model with an "ode" Lambda run.
-EXTENSIONS = dict(Ok=0.0, w0=-1.0, wa=0.0, growth_mode="auto")
+#   growth_mode: "ode" (default) = the GR linear growth ODE in sigma(M), bias, M*,
+#     delta_c(z) and the subhalo formation redshift, for every model; "auto" =
+#     the historical LCDM growth for any Lambda model (exact integral for sigma(M),
+#     Carroll-Press-Turner in bias and M*) and the ODE otherwise, which jumps at
+#     w = -1; "legacy" = the historical growth (Lambda only).
+#   radiation: "engine" (default) = Omega_r = Omega_m/(1 + z_eq) in E(z), hence in
+#     distances, Sigma_cr, rho_crit, lens counts and the growth ODE (the C++
+#     engine's treatment); None = no radiation (the pre-2026-10-12 background).
+EXTENSIONS = dict(Ok=0.0, w0=-1.0, wa=0.0, growth_mode="ode", radiation="engine")
 
 
 def make_cosmology(cosmo=None):
     """The chain's Cosmology: EH98 transfer, smooth-k sigma(M) window, top-hat
     sigma_8 anchor, Ludlow+16 concentrations.  `cosmo` may set h, Om, s8 (P
-    otherwise), Ob, ns, zeq and the EXTENSIONS Ok, w0, wa, growth_mode.
+    otherwise), Ob, ns, zeq and the EXTENSIONS Ok, w0, wa, growth_mode, radiation.
     sigma8 is accepted as an alias for s8."""
     supplied = dict(cosmo or {})
     if "sigma8" in supplied:
@@ -59,15 +57,19 @@ def make_cosmology(cosmo=None):
             raise ValueError(f"{key} must be a finite number")
     if cp["growth_mode"] not in ("auto", "ode", "legacy"):
         raise ValueError("growth_mode must be 'auto', 'ode' or 'legacy'")
+    if cp["radiation"] in ("none", False):
+        cp["radiation"] = None
+    if cp["radiation"] not in ("engine", None):
+        raise ValueError("radiation must be 'engine' or None")
     if not 0 < cp["Ob"] < cp["Om"] <= 1:
         raise ValueError("require 0 < Ob < Om <= 1")
-    # sgl.Cosmology enforces the remaining domain: -2 <= w0 < -0.3, w0 + wa <
-    # -0.3 with negligible early dark energy, E(z)^2 > 0, legacy only for Lambda
+    # sgl.Cosmology enforces the remaining domain: -2 <= w0 <= 1, w0 + wa < 0,
+    # rho_DE/rho_m <= 1e-2 at z = 1100, E(z)^2 > 0, legacy only for Lambda
     return sgl.Cosmology(window="smoothk", transfer="eh98", anchor="tophat",
                          conc_model=16, h=cp["h"], Om=cp["Om"], s8=cp["s8"],
                          Ob=cp["Ob"], ns=cp["ns"], zeq=cp["zeq"],
                          Ok=cp["Ok"], w0=cp["w0"], wa=cp["wa"],
-                         growth_mode=cp["growth_mode"])
+                         growth_mode=cp["growth_mode"], radiation=cp["radiation"])
 
 
 INGREDIENTS = ("ell", "fil", "sub", "bias")
@@ -112,8 +114,9 @@ def to_image_plane(xi, P_s):
 def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
         exact_s=True, k3=True, nproc=1, sub_kw=None, s_taper="cos2", cosmo=None,
         tail_box=True, xi_tail=None, s_is=True, s_seed=None, q_coarse=101,
-        clustering="xilin", edge="rvir", kap_floor=1e-8, phi_tol=1e-8,
-        lam_coarse=0, zint="midpoint", zint_n=2, xi_kw=None, keep=False):
+        clustering="xilin", edge="r200", kap_floor=1e-8, phi_tol=1e-8,
+        lam_coarse=0, zint="midpoint", zint_n=2, xi_kw=None, xi_closure="gauss",
+        window=None, n_xi_wide=None, keep=False):
     # keep=True: meta also carries the intermediate objects (cos, sub, xi, cells,
     # info, lam) so each stage can be inspected (the notebook uses this)
     # zint (2026-10-05): lens-redshift quadrature, sgl_full.z_shells. "engine" =
@@ -142,36 +145,50 @@ def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
         raise ValueError("z_s must be a finite positive number")
     if isinstance(nproc, bool) or not isinstance(nproc, (int, np.integer)) or nproc < 1:
         raise ValueError("nproc must be a positive integer")
-    if edge not in ("rvir", "kthr"):
-        raise ValueError("edge must be 'rvir' or 'kthr'")
+    # edge="r200" (DEFAULT since 2026-10-12, user): field halos cut at r200c and
+    # clumps in the r200c convention (calibrated population selected to r <= r200,
+    # clumps cut at their own r200): no Delta_vir in any halo edge.  "rvir" =
+    # every halo truncated at its virial radius (the default 2026-10-02..12).
+    if edge not in ("r200", "rvir", "kthr"):
+        raise ValueError("edge must be 'r200', 'rvir' or 'kthr'")
+    # xi_closure (2026-10-19): "gauss" = the Gauss-Poisson pair term (default); "vp" =
+    # the positive variance-preserving rectified Cox closure on the same cells
+    # (pos_closure.py): a valid characteristic function at every z_s
+    if xi_closure not in ("gauss", "vp"):
+        raise ValueError(f"xi_closure must be 'gauss' or 'vp', got {xi_closure!r}")
     s = on(cfg)
+    use_xi = clustering == "xilin" and "bias" in s
+    if use_xi and edge == "kthr":
+        raise ValueError("clustering='xilin' needs edge='r200' or 'rvir'")
+    if xi_closure != "gauss" and not use_xi:
+        raise ValueError(f"xi_closure={xi_closure!r} needs xilin clustering and the bias ingredient")
     cos = make_cosmology(cosmo)
-    if (cosmo or {}).get("growth_mode", "auto") == "auto" and cos.growth_mode == "ode":
+    if {**EXTENSIONS, **(cosmo or {})}["growth_mode"] == "auto" and cos.growth_mode == "ode":
         warnings.warn("growth_mode='auto' resolved to 'ode' for non-Lambda dark energy, "
-                      "while Lambda runs (and the stored references) use the historical "
-                      "growth; compare against a growth_mode='ode' Lambda run.", stacklevel=2)
+                      "while Lambda runs under 'auto' use the historical growth; compare "
+                      "against a growth_mode='ode' Lambda run.", stacklevel=2)
     t0 = time.time()
-    # defaults (2026-10-02) = the CLI defaults: exact moment sector, clumps
-    # truncated at their r_vir; explicit sub_kw entries override them
-    skw = dict(sector="exact", clump_edge="rvir", exact_kw=dict(method="moments"))
+    # defaults = the CLI defaults: exact moment sector, clumps in the convention
+    # of the halo edge; explicit sub_kw entries override them
+    trunc = "r200" if edge == "r200" else "rvir"
+    skw = dict(sector="exact", clump_edge=trunc, exact_kw=dict(method="moments"))
     skw.update(sub_kw or {})
     # kthr only for the engine split (edge "kthr") or a kthr-based subhalo law
     # (pairs sector / clump_edge "kthr"); the default chain has none (2026-10-02)
-    need_kthr = edge == "kthr" or ("sub" in s and skw["clump_edge"] != "rvir")
+    need_kthr = edge == "kthr" or ("sub" in s and skw["clump_edge"] == "kthr")
     kthr = F.kappa_threshold(cos, zs) if need_kthr else None
     sub = None
     if "sub" in s:
         from . import subhalos
         sub = subhalos.SubhaloModel(cos, zs, kthr, split=split, **skw)
     # edge (2026-10-02): "kthr" = the engine split (explicit halos to r_max,
-    # Gaussian faint-lens arm beyond); "rvir" = every NFW halo truncated at its
-    # virial radius and integrated exactly to the kap_floor of its shear tail
+    # Gaussian faint-lens arm beyond); "r200" / "rvir" = every NFW halo truncated
+    # at that radius and integrated exactly to the kap_floor of its shear tail
     # (no kthr / r_max / diffusion term; the whole truncated halo is the host).
-    ekw = {} if edge == "kthr" else dict(kap_floor=kap_floor, trunc="rvir")
-    use_xi = clustering == "xilin" and "bias" in s
-    if use_xi and edge == "kthr":
-        raise ValueError("clustering='xilin' needs edge='rvir'")
+    ekw = {} if edge == "kthr" else dict(kap_floor=kap_floor, trunc=trunc)
     xi = F.xi_kperp_grid(cos, **(xi_kw or {})) if use_xi else None
+    if xi_closure != "gauss":
+        xi["pos"] = True
     cells, info = F.build_population(cos, zs, ell="ell" in s, fils="fil" in s,
                                      nord=nord, kthr=kthr, subhalo=sub, nproc=nproc,
                                      zint=zint, zint_n=zint_n, xi=xi, **ekw)
@@ -184,6 +201,10 @@ def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
     lam = F.Lam(cells, C=C, nord=nord, exactS=exact_s, k3=k3, s_taper=s_taper, s_is=s_is,
                 q_coarse=q_coarse, lss_var=lss_var, lam_coarse=lam_coarse, xi=use_xi,
                 **({} if s_seed is None else dict(seed=int(s_seed))))
+    pos = None
+    if xi_closure != "gauss":
+        from . import pos_closure
+        pos = pos_closure.install(lam, cos, kind=xi_closure)
     sig = lam.sigma()
     t_lam = time.time()
     # one inversion, one normalisation: the clipped grid and the tail grid are
@@ -203,15 +224,28 @@ def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
     # BLAS-threaded, and a process pool on top (nproc > 1) oversubscribed the
     # cores -- z_s=3 invert 278 s vs 8 s serial, PDF identical.  nproc is for
     # the build only.
+    # window (2026-10-19): None -> "auto" for the positive closure (window the box
+    # only when the k-reach does not converge: its near-empty-sightline |Phi| floor
+    # at low z_s), False for gauss
+    if window is None:
+        window = "auto" if xi_closure != "gauss" else False
+    # n_xi_wide (2026-10-19): points of invert's normalisation / moment grid (60
+    # sigma wide). 500 (step 0.12 sigma) mis-normalised sharp low-z_s peaks by
+    # ~0.16%; the positive closure uses 4000. None = 500 for gauss, 4000 otherwise.
+    if n_xi_wide is None:
+        n_xi_wide = 500 if xi_closure == "gauss" else 4000
     xa, Pa, meta = F.invert(lam, sig, xi_out=xall, grid_scale=grid_scale,
-                            tail_box=tail_box, phi_tol=phi_tol, nproc=1)
+                            tail_box=tail_box, phi_tol=phi_tol, nproc=1, window=window,
+                            n_xi_wide=n_xi_wide)
     xo, Ps = xa[:nx], Pa[:nx]
     t_inv = time.time()
-    out = dict(t_stages=dict(build=t_build - t0, lam=t_lam - t_build, invert=t_inv - t_lam),zs=zs, cfg=cfg_name(cfg),
+    dp = getattr(lam, "_direct_product_evaluator", None)
+    out = dict(t_stages=dict(build=t_build - t0, lam=t_lam - t_build, invert=t_inv - t_lam), zs=zs, cfg=cfg_name(cfg),
                zint=zint, zint_n=(zint_n if zint == "gauss" else None), clustering=clustering,
                xi_kperp=({k: xi[k] for k in ("kmin", "kmax", "per_decade", "mmax")} if xi else None), edge=edge, lss_var=lss_var,
                kap_floor=(kap_floor if edge != "kthr" else None), kbar=info["kbar"], h=cos.h, Om=cos.Om, s8=cos.s8, Ob=cos.Ob, ns=cos.ns, zeq=cos.zeq, sigma8=cos.s8,
-               Ok=cos.Ok, w0=cos.w0, wa=cos.wa, growth_mode=cos.growth_mode, nord=nord, grid_scale=grid_scale, split=split,
+               Ok=cos.Ok, w0=cos.w0, wa=cos.wa, growth_mode=cos.growth_mode,
+               radiation=cos.radiation, Omega_r=cos.Or, nord=nord, grid_scale=grid_scale, split=split,
                nproc=nproc, sub_kw=(sub._init_kw if sub is not None else None),
                pair_angle=(sub.pair_angle if sub is not None else None),
                k3=lam.k3, exactS=bool(lam.exactS), s_taper=lam.s_taper,
@@ -221,6 +255,12 @@ def run(zs, cfg, nord=4, grid_scale=1.0, xi_out=None, split=10.0,
                grid={k: v for k, v in meta["grid"].items()
                      if isinstance(v, (int, float))},
                tail_box=bool(tail_box), fine=dict(F.FINE), s_is=bool(s_is),
+               xi_closure=xi_closure, window=window, n_xi_wide=n_xi_wide,
+               pos_closure=(None if pos is None else dict(
+                   kind=pos.kind, eta=pos.eta, nstate=len(pos.w), shells=len(pos.sh),
+                   eval_kernel=getattr(pos, "eval_kernel", "grouped"),
+                   setup_seconds=pos.setup_seconds, lnR_seconds=pos.seconds)),
+               direct_product_backend=(dp.backend_name if dp is not None else "unused"),
                s_seed=(int(s_seed) if s_seed is not None else None),
                s_seed_effective=(int(s_seed) if s_seed is not None
                                  else int(inspect.signature(F.Lam.__init__).parameters["seed"].default)),

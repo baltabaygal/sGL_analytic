@@ -13,6 +13,7 @@ population is checked to reproduce `sgl.P_vector_lnmu` (see __main__).
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from .sgl import (PHI_TOL, PPP_G, PPP_K, XI_REACH, _trapz, vector_grid)
 # (0.97, 0.5) agrees to <= 6e-5 over ln mu = 0.3-7 at z_s = 1.
 TAIL_KAP_MAX = 0.99
 TAIL_GAM_MAX = 0.8
+TAIL_PPP_G = 12.0     # min k_gamma trapezoid points per J0 period at the tail box's gamma_max (2026-10-19)
 def _reach(lam, k0, axis, tol=PHI_TOL, max_mult=64.0):
     """sgl.phi_reach for an arbitrary Lambda callable lam(k_k, k_g)."""
     mults = 1.25 ** np.arange(0, int(np.ceil(log(max_mult) / log(1.25))) + 1)
@@ -45,10 +47,119 @@ def _reach(lam, k0, axis, tol=PHI_TOL, max_mult=64.0):
     return float(ks[i]), float(phi[i])
 
 
-def invert(lam, sigma, xi_out=None, n_k_int=300, xi_reach=XI_REACH,
+
+# blocked inversion threshold (2026-10-16): grids above this many Fourier points are
+# inverted in k_kappa row blocks (every z_s >= 0.5 Planck grid is below it -> unchanged).
+INVERT_BLOCK_PTS = 20_000_000
+INVERT_BLOCK_BYTES = 256e6          # target size of the largest per-block array
+# Output (kappa, gamma) grid budget (2026-10-20): above it the grid keeps the uniform grid's own nodes over the
+# width-relative body box and grows geometrically (0.05% per point) out to the tail box (2229 forced: tails P(> 1, 2)
+# within 0.02%, P(> 4) 0.4%, of the uniform grid). Only the narrowest low-z_s configs exceed it (1716: 28516 x 11348 = 324M cells, > 11 GB of
+# transform arrays -> swap); every config computed before (max 307M, 0798) stays bit-identical. Env override
+# SGL_OUT_GRID_MAX (tests).
+OUT_GRID_MAX = float(os.environ.get("SGL_OUT_GRID_MAX", 3.4e7))   # 2026-10-20: 3.1e8 -> 3.4e7 (just above every Gaussian output, max 33.2M = 2562)
+# KAPPA_FFT (2026-10-20): in the blocked inversion, evaluate the kappa sum sum_k w e^{-i k kappa} F(k) with a chirp-z
+# (scipy ZoomFFT, Bluestein) transform per k_kappa block whenever the kappa output axis is UNIFORM (output grid
+# below OUT_GRID_MAX); above it the axis is geometric and the dense real cos/sin GEMMs are used (fewer points,
+# faster there). Same discrete sum; gate (2047/155/2229/0081): vs stored <= 4e-15 of peak where uniform, chirp-z
+# 15-20% faster there. Env SGL_KAPPA_FFT=0 disables.
+KAPPA_FFT = os.environ.get("SGL_KAPPA_FFT", "1") == "1"
+OUT_GRID_RATIO = float(os.environ.get("SGL_OUT_GRID_RATIO", 1.0005))   # 1.01: P(>2) off by 50%; 1.0005: 0.02%
+
+
+def _geom_axis(a, b, c, h, r=OUT_GRID_RATIO):
+    """Uniform step h on [a, b], then steps h r, h r^2, ... from b up to c (last point exactly c)."""
+    m = int(np.ceil((b - a) / h))
+    u = a + h * np.arange(m + 1)                  # nodes a + i h (as np.linspace(a, c, n) with step h)
+    b = u[-1]
+    if c <= b:
+        return np.concatenate([u[u < c], [c]])
+    n = int(np.ceil(np.log1p((c - b) * (r - 1.0) / (h * r)) / np.log(r)))
+    t = b + h * r * (r ** np.arange(1, n + 1) - 1.0) / (r - 1.0)
+    t = t[t < c - 0.5 * h]
+    return np.concatenate([u, t, [c]])
+
+
+def _window_pd(k_k, k_g):
+    """Positive-definite damping window on the inversion box (2026-10-19, from
+    experiments/psi2_positivity/clamp/window.py): cubic B-spline in k_kappa (support [0, K]; its
+    1D transform ~ sinc^4 >= 0) x Wendland phi_{3,1} in k_gamma (support [0, Q]; positive definite
+    on R^d, d <= 3). Multiplying a VALID characteristic function by it gives P convolved with a
+    nonnegative, unit-mass kernel of width ~ 2 pi / K: no truncation ringing, P >= 0 up to
+    discretisation. Returns (W_k, W_g)."""
+    K, Q = float(k_k[-1]), float(k_g[-1])
+    x = np.abs(k_k) * 2.0 / K
+    wk = np.where(x < 1, 2 / 3 - x**2 + x**3 / 2, np.where(x < 2, (2 - x)**3 / 6, 0.0)) / (2 / 3)
+    r = np.clip(np.abs(k_g) / Q, 0.0, 1.0)
+    return wk, (1 - r)**4 * (4 * r + 1)
+
+
+def _kappa_sum_fft(fr, fi, k_blk, kap, acc, tile=64, _cache={}):
+    """acc += Re[sum_j e^{-i k_j kappa} (fr + i fi)_j] for uniform k_blk and uniform kap (chirp-z / ZoomFFT)."""
+    from scipy.signal import ZoomFFT
+    n = k_blk.size
+    dk = (k_blk[-1] - k_blk[0]) / (n - 1)          # endpoint spacing: no cancellation at large k
+    key = (n, float(dk), float(kap[0]), float(kap[-1]), kap.size)
+    tr = _cache.get(key)
+    if tr is None:
+        _cache.clear()
+        tr = _cache[key] = ZoomFFT(n, [kap[0] * dk, kap[-1] * dk], kap.size, fs=2 * pi, endpoint=True)
+    phase = np.exp(-1j * kap * k_blk[0])[:, None]
+    for a in range(0, fr.shape[1], tile):
+        b = min(a + tile, fr.shape[1])
+        acc[:, a:b] += (tr(fr[:, a:b] + 1j * fi[:, a:b], axis=0) * phase).real
+
+
+def _invert_blocked(lam, k_k, k_g, kap, gam, nproc, win=None):
+    """P_vector_joint accumulated over k_kappa row blocks; returns (P3, Phi[:, 0], Phi[:, 1])."""
+    import scipy.special as sp
+    dk_k, dk_g = k_k[1] - k_k[0], k_g[1] - k_g[0]
+    w_kg = np.full(k_g.size, dk_g); w_kg[0] *= 0.5; w_kg[-1] *= 0.5
+    M = (k_g * w_kg)[:, None] * sp.j0(np.outer(gam, k_g)).T          # (nk_g, n_gam)
+    w_kk = np.full(k_k.size, dk_k); w_kk[0] *= 0.5; w_kk[-1] *= 0.5
+    widest = max(k_g.size, kap.size, 8000)                              # 8000 ~ separable nodes
+    nb = int(np.clip(INVERT_BLOCK_BYTES / (16.0 * widest), 64, k_k.size))
+    # (2026-10-20) REAL arithmetic: only Re P is kept, M is real. Phi @ M as two real GEMMs (numpy promoted the
+    # whole real Hankel matrix to complex for every block) and Re[e^{-i k kappa} (F_r + i F_i)] = cos F_r + sin F_i
+    # (two real GEMMs instead of one complex one + a complex accumulator). Same sums; roundoff-level change.
+    # Profile (0081, z_s 0.33): these transforms were 402 s of 595 s.
+    acc = np.zeros((kap.size, gam.size))
+    Phi0 = np.empty(k_k.size, complex); Phi1 = np.empty(k_k.size, complex)
+    hk = (kap[-1] - kap[0]) / (kap.size - 1)
+    kfft = KAPPA_FFT and kap.size > 2 and bool(np.allclose(np.diff(kap), hk, rtol=1e-9, atol=0.0))
+    lam._ext = (float(k_k[-1]), float(k_g[-1]))
+    try:
+        lo = 0
+        while lo < k_k.size:
+            hi = min(lo + nb, k_k.size)
+            if k_k.size - hi < 2:
+                hi = k_k.size                                          # no 1-row tail block
+            Phib = np.exp(lam(k_k[lo:hi], k_g, nproc=nproc))
+            if win is not None:
+                Phib *= win[0][lo:hi, None] * win[1][None, :]
+            Phi0[lo:hi], Phi1[lo:hi] = Phib[:, 0], Phib[:, 1]
+            wb = w_kk[lo:hi, None]
+            Fr = (np.ascontiguousarray(Phib.real) @ M) * wb
+            Fi = (np.ascontiguousarray(Phib.imag) @ M) * wb
+            del Phib
+            if kfft:
+                _kappa_sum_fft(Fr, Fi, k_k[lo:hi], kap, acc)
+            else:
+                ph = np.outer(kap, k_k[lo:hi])
+                acc += np.cos(ph) @ Fr
+                acc += np.sin(ph) @ Fi
+                del ph
+            del Fr, Fi
+            lo = hi
+    finally:
+        lam._ext = None
+        lam.__dict__.pop("_qcache", None)
+    return (1.0 / (2.0 * pi**2)) * acc, Phi0, Phi1
+
+def invert(lam, sigma, xi_out=None, n_k_int=2400, xi_reach=XI_REACH,
            n_xi_wide=500, grid_scale=1.0, kap_max=None, gam_max=None,
            keep_dk=True, hankel_em=True, tail_box=True, phi_tol=PHI_TOL,
-           nproc=1, **override):
+           nproc=1, window=False, **override):
     """Phi = exp(lam) -> P_s(ln mu).  Mirrors sgl.P_vector_lnmu line for line
     after its population build; `sigma` = total sigma_kappa sets the grid.
 
@@ -78,11 +189,21 @@ def invert(lam, sigma, xi_out=None, n_k_int=300, xi_reach=XI_REACH,
     xi_out = np.asarray(xi_out, float)
     grid = vector_grid(sigma, xi_reach=xi_reach)
     g0 = grid["gam_max"]                       # default (6 sigma) gamma reach
+    k0_body = grid["kap_max"]                  # default (width-relative) kappa reach
     if tail_box:
         kap_max = max(grid["kap_max"], TAIL_KAP_MAX) if kap_max is None else kap_max
         gam_max = max(g0, TAIL_GAM_MAX) if gam_max is None else gam_max
     dk0 = (2 * pi / (PPP_K * max(abs(grid["kap_min"]), grid["kap_max"])),
            2 * pi / (PPP_G * grid["gam_max"]))
+    if tail_box and gam_max is not None and TAIL_PPP_G:
+        # (2026-10-19, from experiments/lognormal_closure dev copy) keep_dk inherits dk_g from the
+        # 6-sigma default gamma box; for sigma_kappa < 0.0167 that leaves < 12 trapezoid points per
+        # J0(k_g gamma) period at the tail box's gamma = 0.8 and a NEGATIVE tail pedestal (Planck
+        # z_s = 0.2, Psi_1 alone: neg mass 1.9e-4, P(ln mu > 0.2) = -1.5e-4 -> 1.4e-8 with the cap).
+        # Cap dk_g at TAIL_PPP_G points per period at the tail gamma. Grids already finer are
+        # untouched (bit-identical); it changed 39 of the 3903 finished z_s >= 0.5 training configs
+        # (experiments/lowz_vp/gate_finished.py, ids_gamma_affected.txt).
+        dk0 = (dk0[0], min(dk0[1], 2 * pi / (TAIL_PPP_G * gam_max)))
     if (kap_max is not None and kap_max != grid["kap_max"]) or \
             (gam_max is not None and gam_max != grid["gam_max"]):
         if kap_max is not None:
@@ -102,6 +223,19 @@ def invert(lam, sigma, xi_out=None, n_k_int=300, xi_reach=XI_REACH,
     grid["nk_k"] = int(np.ceil(grid["k_k_max"] / dk_k)) + 1
     grid["nk_g"] = int(np.ceil(grid["k_g_max"] / dk_g)) + 1
     grid.update(phi_at_k_cut=phi_k, phi_at_g_cut=phi_g)
+    if getattr(lam, "xi_coarse_rule", False) and getattr(lam, "xi_coarse", 0):
+        # (2026-10-19, positive closures only: pos_closure.install sets the flag) the clustering
+        # term's coarse grid k = K s^2 must follow ln R as the box grows at low z_s, PER AXIS:
+        #  k_gamma: spacing <= 0.5 in q sigma at q sigma = 10 -> n_q - 1 >= 12.65 sqrt(Q sigma) (>= the default);
+        #  k_kappa: ln R has structure on Delta(k sigma) ~ 1 (coarse kappa bins) out to the box edge, which a
+        #   square grid cannot follow: spacing <= 0.3 in k sigma at k sigma = 100 -> n_k - 1 >= 66.7 sqrt(K sigma).
+        #   Square 367^2 left the floor cases (z_s ~0.2, s8 ~1.3) with neg mass 2e-5..6e-5 at the sharp lower
+        #   edge; 2001 / 4001 k-nodes: 1e-7 / 3e-9, agreeing to 2.6e-7 of peak (experiments/lowz_vp, fig7).
+        kks_, kgs_ = grid["k_k_max"] * sigma, grid["k_g_max"] * sigma
+        lam.xi_coarse = int(min(401, max(lam.xi_coarse, 1 + np.ceil(12.65 * np.sqrt(kgs_)))))
+        lam.xi_coarse_k = int(min(4001, max(getattr(lam, "xi_coarse_k", 0) or 0, lam.xi_coarse,
+                                            1 + np.ceil(66.7 * np.sqrt(kks_)))))
+        grid.update(xi_coarse=float(lam.xi_coarse), xi_coarse_k=float(lam.xi_coarse_k))
     grid.update(override)
     if grid_scale != 1.0:
         for key in ("nk_k", "nk_g", "n_kap", "n_gam"):
@@ -109,10 +243,37 @@ def invert(lam, sigma, xi_out=None, n_k_int=300, xi_reach=XI_REACH,
 
     k_k = np.linspace(0.0, grid["k_k_max"], grid["nk_k"])
     k_g = np.linspace(0.0, grid["k_g_max"], grid["nk_g"])
-    Phi = np.exp(lam(k_k, k_g, nproc=nproc))
-    kap = np.linspace(grid["kap_min"], grid["kap_max"], grid["n_kap"])
-    gam = np.linspace(0.0, grid["gam_max"], grid["n_gam"])
-    P3 = sgl.P_vector_joint(k_k, k_g, Phi, kap, gam)
+    if grid["n_kap"] * grid["n_gam"] > OUT_GRID_MAX:
+        # the uniform grid's own step, so the body nodes are the uniform grid's nodes
+        hk = (grid["kap_max"] - grid["kap_min"]) / (grid["n_kap"] - 1)
+        hg = grid["gam_max"] / (grid["n_gam"] - 1)
+        kap = _geom_axis(grid["kap_min"], min(k0_body, grid["kap_max"]), grid["kap_max"], hk)
+        gam = _geom_axis(0.0, min(g0, grid["gam_max"]), grid["gam_max"], hg)
+        grid.update(out_grid_geometric=1.0, n_kap=int(kap.size), n_gam=int(gam.size))
+    else:
+        kap = np.linspace(grid["kap_min"], grid["kap_max"], grid["n_kap"])
+        gam = np.linspace(0.0, grid["gam_max"], grid["n_gam"])
+    # window (2026-10-19): False (default) = raw truncation at the reach; True = always apply the
+    # positive-definite window _window_pd on the box; "auto" = only when the reach did NOT converge
+    # (|Phi| > phi_tol at a box edge: the near-empty-sightline floor of positive clustering closures
+    # at low z_s), where raw truncation rings. Only meaningful for a valid CF.
+    use_win = window is True or (window == "auto" and max(phi_k, phi_g) > phi_tol)
+    win = _window_pd(k_k, k_g) if use_win else None
+    grid.update(window=float(use_win))
+    blocked = (k_k.size * k_g.size > INVERT_BLOCK_PTS and hasattr(lam, "_direct_call")
+               and getattr(lam, "lam_coarse", 0) == 0)
+    if blocked:
+        # (2026-10-16) k_kappa row blocks: Phi, the Hankel product and the kappa
+        # transform (and the Euler-Maclaurin endpoint terms) are accumulated block by
+        # block, so peak memory is O(block) instead of O(grid) (pilot z_s=0.2: a
+        # 52k x 6.5k grid needed > 10 GB). Same sums, partial-sum order -> roundoff.
+        P3, Phi0, Phi1 = _invert_blocked(lam, k_k, k_g, kap, gam, nproc, win=win)
+    else:
+        Phi = np.exp(lam(k_k, k_g, nproc=nproc))
+        if win is not None:
+            Phi *= win[0][:, None] * win[1][None, :]
+        P3 = sgl.P_vector_joint(k_k, k_g, Phi, kap, gam)
+        Phi0, Phi1 = Phi[:, 0], Phi[:, 1]
     if hankel_em:
         dkk, dkg = k_k[1] - k_k[0], k_g[1] - k_g[0]
         wkk = np.full(k_k.size, dkk); wkk[0] *= 0.5; wkk[-1] *= 0.5
@@ -120,12 +281,20 @@ def invert(lam, sigma, xi_out=None, n_k_int=300, xi_reach=XI_REACH,
         # (Phi even in k_g); Euler-Maclaurin (B2 = 1/6, B4 = -1/30):
         # integral = T + (h^2/12) g'(0) - (h^4/720) g^(3)(0), g'(0) = Phi0, g^(3)(0) = 6 (Phi2 - gam^2 Phi0 / 4).
         # Phi2 from the first two k_g columns (O(h^2) accurate).
-        Phi0 = Phi[:, 0]
-        Phi2 = (Phi[:, 1] - Phi[:, 0]) / dkg**2
-        E = np.exp(-1j * np.outer(kap, k_k)) * wkk[None, :]
+        Phi2 = (Phi1 - Phi0) / dkg**2
         c = 1.0 / (2.0 * pi**2)
-        a = c * np.real(E @ ((dkg**2 / 12.0) * Phi0 - (dkg**4 / 120.0) * Phi2))
-        b = c * np.real(E @ ((dkg**4 / 480.0) * Phi0))
+        va = (dkg**2 / 12.0) * Phi0 - (dkg**4 / 120.0) * Phi2
+        vb = (dkg**4 / 480.0) * Phi0
+        if blocked:
+            a = np.zeros(kap.size); b = np.zeros(kap.size)
+            for lo in range(0, k_k.size, 2048):
+                hi = min(lo + 2048, k_k.size)
+                Eb = np.exp(-1j * np.outer(kap, k_k[lo:hi])) * wkk[None, lo:hi]
+                a += c * np.real(Eb @ va[lo:hi]); b += c * np.real(Eb @ vb[lo:hi])
+        else:
+            E = np.exp(-1j * np.outer(kap, k_k)) * wkk[None, :]
+            a = c * np.real(E @ va)
+            b = c * np.real(E @ vb)
         P3 = P3 + a[:, None] + b[:, None] * gam[None, :]**2
     ip = RegularGridInterpolator((kap, gam), P3, bounds_error=False,
                                  fill_value=0.0)
@@ -233,6 +402,57 @@ EPS_FLOOR = 1e-3                                    # weak-arm floor / kappa_thr
 # i.e. d gamma ~ 0.04 at gamma ~ 0.5) is comparable to sigma_kappa = 0.037.
 import os as _os
 _FM = float(_os.environ.get("SGL_FINE_MULT", "1"))
+# SGL_MMAX (env, default inf; 2026-10-07): DIAGNOSTIC upper cut on the halo
+# (and filament) mass function -- every (z, M) cell with M > SGL_MMAX is
+# skipped in the builder.  Emulates a finite simulation box that lacks the
+# rarest halos (Takahashi+11 comparison, docs/finite_source.md). Read at
+# import so spawned build workers inherit it. Not a physical default.
+MMAX_CUT = float(_os.environ.get("SGL_MMAX", "inf"))
+# SGL_MMIN (env, default 0; 2026-10-07): DIAGNOSTIC lower cut -- cells with
+# M < SGL_MMIN skipped (an N-body particle-mass resolution limit).
+MMIN_CUT = float(_os.environ.get("SGL_MMIN", "0"))
+# SGL_BOX (env, comoving box side in h^-1 Mpc, default off; 2026-10-07):
+# DIAGNOSTIC z-dependent cap M_box(z) where one box expects ONE halo above it,
+# V N(>M_box, z) = 1 -- a finite simulation box lacks rarer halos.
+BOX_HMPC = float(_os.environ.get("SGL_BOX", "0"))
+_box_cache = {}
+# SGL_XI_MMIN / SGL_XI_MMAX / SGL_XI_FIL (env; 2026-10-08): DIAGNOSTIC switches for the xi_lin
+# pair term Psi_2 -- halos with M outside [MMIN, MMAX) (and filaments if FIL=0) get bias 0 in the
+# xi deposit, i.e. no clustering, while their jumps stay in Psi_1.  Used to find which lens
+# classes make the clustered density negative (docs/image_types.md).  Default: all on.
+XI_MMIN = float(_os.environ.get("SGL_XI_MMIN", "0"))
+XI_MMAX = float(_os.environ.get("SGL_XI_MMAX", "inf"))
+# SGL_XI_LINEAR_M (env; 2026-10-13, PROTOTYPE, default 0 = off): halos with M below it
+# enter the xi_lin pair term Psi_2 only through their LINEAR response i k.q (exact
+# first moments sum beta w kappa J0, sum beta w gamma J2), not F = e^{ik.q} - 1.
+# Their pair contribution F F' = -k^2 kappa kappa' + O(k^3 kappa^3) keeps the k^2
+# (variance) term exactly and drops orders that act only at k ~ 1/kappa_faint; it
+# removes the Gaussian-count revival Re ln Phi -> -N + Var(N)/2 > 0 that the many
+# faint covering halos cause at low z_s / high sigma8 (tmp/training_set/excl_diag.py).
+# SGL_XI_LINEAR_FIL=1 applies the same to filaments.
+XI_LINEAR_M = float(_os.environ.get("SGL_XI_LINEAR_M", "0"))
+XI_LINEAR_FIL = _os.environ.get("SGL_XI_LINEAR_FIL", "0") == "1"
+XI_FIL = int(_os.environ.get("SGL_XI_FIL", "1"))
+
+
+def _box_mmax(cos, z, Ml, dlnM):
+    """M with (L/h)^3 N(>M, z) = 1 on the builder's own mass grid (log interp)."""
+    key = (id(cos), float(z))
+    if key not in _box_cache:
+        V = (BOX_HMPC / cos.h)**3
+        dn = np.array([cos.dndlnM(Ml[j], z) * dlnM[j - 1] for j in range(1, NM_ENG)])
+        Ncum = V * np.cumsum(dn[::-1])[::-1]            # N(>= M_j) per box
+        M = Ml[1:]
+        i = np.nonzero(Ncum >= 1.0)[0]
+        if len(i) == 0:
+            _box_cache[key] = M[0]
+        elif i[-1] == len(M) - 1:
+            _box_cache[key] = np.inf
+        else:
+            j = i[-1]                                   # Ncum[j] >= 1 > Ncum[j+1]
+            t = (np.log(Ncum[j]) - 0.0) / (np.log(Ncum[j]) - np.log(Ncum[j + 1]))
+            _box_cache[key] = float(np.exp(np.log(M[j]) + t * (np.log(M[j + 1]) - np.log(M[j]))))
+    return _box_cache[key]
 FINE = dict(k=(1e-7, 30.0, int(round(480 * _FM))), g=(1e-9, 30.0, int(round(300 * _FM))))
 COARSE = dict(k=(1e-7, 30.0, 170), g=(1e-9, 30.0, 110))
 
@@ -311,6 +531,8 @@ def Dg(cos, z):
         E2 = a3 + cos.OL
         if getattr(cos, "Ok", 0.0) != 0.0:
             E2 += cos.Ok * (1 + zz)**2
+        if getattr(cos, "Or", 0.0) != 0.0:      # engine: Az includes Or (1+z)^4
+            E2 += cos.Or * (1 + zz)**4
         Omz, OLz = a3 / E2, cos.OL / E2
         return 2.5 * Omz / (Omz**(4 / 7) - OLz + (1 + Omz / 2) * (1 + OLz / 70)) / (1 + zz)
     return nn(z) / nn(0.0)
@@ -1045,6 +1267,18 @@ def _hist_from_index(xy, nb, w):
     return np.bincount(xy, w, minlength=nb[0] * nb[1]).reshape(nb)[1:-1, 1:-1]
 
 
+def _xi_rate_deposit(Wb, K, G, W, ce):
+    """Positive closure (pos_closure): lens rate W per coarse (kappa, gamma) bin of the xi deposit points,
+    with the xi kernels' binning (last edge inclusive, out-of-box points dropped)."""
+    nkc, ngc = ce[0].size - 1, ce[1].size - 1
+    a = np.searchsorted(ce[0], K, side="right")
+    b = np.searchsorted(ce[1], G, side="right")
+    a = np.where(K == ce[0][-1], a - 1, a)
+    b = np.where(G == ce[1][-1], b - 1, b)
+    ok = (a >= 1) & (a <= nkc) & (b >= 1) & (b <= ngc)
+    np.add.at(Wb, (a[ok] - 1) * ngc + (b[ok] - 1), W[ok])
+
+
 class Cells:
     """Accumulator of binned jump cells, split per z-shell for the Cox term."""
 
@@ -1077,7 +1311,7 @@ class Cells:
         self.N = 0.0
         self.lin = {}                               # (shell, beta) -> sum w kappa
 
-    def add(self, K, G, W, shell, beta, R=None, tang=True):
+    def add(self, K, G, W, shell, beta, R=None, tang=True, xi_linear=False):
         """Deposit one object and return its coarse histogram for consumers.
 
         The returned view is independent of the accumulator and may be
@@ -1096,7 +1330,10 @@ class Cells:
             R = np.asarray(R, dtype=float).ravel()
             if R.size != K.size:
                 raise ValueError("R must give one lens distance per point")
-            self._xi_deposit(K, G, W, R, beta, tang)
+            if xi_linear:
+                self._xi_deposit_linear(K, G, W, R, beta, tang)
+            else:
+                self._xi_deposit(K, G, W, R, beta, tang)
         if _HAVE_NUMBA:
             betas = np.array([beta**n for n in range(self.nord + 1)])
             if np.all(np.isfinite(betas)):
@@ -1154,13 +1391,22 @@ class Cells:
         self._xi_cur = dict(dchi=float(dchi),
                             Hx=np.zeros((nkc, ngc, mm + 1, nkp)),
                             lx=np.zeros((2, nkp)))
+        if self.xi.get("pos"):          # positive closure: lens rate per coarse bin (pos_closure)
+            self._xi_cur["Wb"] = np.zeros(nkc * ngc)
 
     def _xi_deposit(self, K, G, W, R, beta, tang):
         cur = self._xi_cur
         if cur is None:
             raise RuntimeError("xi deposit outside xi_begin / xi_end")
         import scipy.special as sp
-        order = np.argsort(R, kind="stable")
+        if "Wb" in cur:
+            _xi_rate_deposit(cur["Wb"], K, G, W, self.ce)
+        # half the deposits (z_s=1: 6633 / 13266) arrive already sorted in R: the stable
+        # argsort is then the identity (2026-10-16 fast path, bit-identical)
+        if R.size < 2 or bool(np.all(R[1:] >= R[:-1])):
+            order = np.arange(R.size)
+        else:
+            order = np.argsort(R, kind="stable")
         Rs = R[order]
         new = np.empty(Rs.size, bool)
         new[:1] = True
@@ -1169,7 +1415,12 @@ class Cells:
         gstart = np.append(np.flatnonzero(new), Rs.size).astype(np.int64)
         kp, mm = self.xi["kp"], self.xi["mmax"]
         x = np.outer(Ru, kp)
-        Jt = np.zeros((Ru.size, mm + 1, kp.size))
+        # >= 3 planes (2026-10-18): _bessel_pack_nb always writes planes 1 and 2 (zeros when m > mm);
+        # with mmax < 2 (xi_kw mmax=1, the training setting) a (Ru, mm + 1, nkp) table took an
+        # out-of-bounds write of up to nkp doubles past its end -> heap corruption (random pool-worker
+        # hangs in dict lookups / segfaults in gc; NUMBA_BOUNDSCHECK=1 -> IndexError). Planes m <= mm
+        # were always correct; the kernels read only m <= mm.
+        Jt = np.zeros((Ru.size, max(mm, 2) + 1, kp.size))
         if _HAVE_NUMBA:
             j0_arr = sp.j0(x)
             j1_arr = sp.j1(x) if (tang and mm >= 1) else j0_arr
@@ -1188,6 +1439,29 @@ class Cells:
                         np.ascontiguousarray(W, dtype=float), order.astype(np.int64), gstart,
                         Jt, float(beta), mm,
                         cur["Hx"], cur["lx"], self.ce[0], self.ce[1], self._p[2], self._p[3])
+
+    def _xi_deposit_linear(self, K, G, W, R, beta, tang):
+        """SGL_XI_LINEAR_M prototype (2026-10-13): only the exact first moments
+        lx[0] += beta w kappa J0(k R), lx[1] += beta w gamma J2(k R) of the points
+        inside the coarse box (the same points _xi_add_kernel would bin); nothing
+        in Hx, so xi_end carries them as the residual linear term."""
+        cur = self._xi_cur
+        if cur is None:
+            raise RuntimeError("xi deposit outside xi_begin / xi_end")
+        import scipy.special as sp
+        ekc, egc = self.ce
+        inb = (K >= ekc[0]) & (K <= ekc[-1]) & (G >= egc[0]) & (G <= egc[-1])
+        if not inb.any():
+            return
+        K, G, W, R = K[inb], G[inb], W[inb], R[inb]
+        Ru, iR = np.unique(R, return_inverse=True)
+        bw = beta * W
+        sk = np.bincount(iR, bw * K, minlength=Ru.size)
+        x = np.outer(Ru, self.xi["kp"])
+        cur["lx"][0] += sk @ sp.j0(x)
+        if tang and self.xi["mmax"] >= 1:
+            sg = np.bincount(iR, bw * G, minlength=Ru.size)
+            cur["lx"][1] += sg @ sp.jv(2, x)
 
     def xi_add_shear_tail(self, beta, Gam, Rm, n_area):
         """Analytic shear tail beyond the emitted radius Rm (2026-10-05): kappa = 0
@@ -1219,7 +1493,10 @@ class Cells:
             H = Hx[:, :, m, :].reshape(-1, Hx.shape[3])
             idx = np.flatnonzero(np.any(H != 0, axis=1))
             if idx.size == 0:
-                continue
+                # linear-only node (SGL_XI_LINEAR_M): one all-zero bin carries lres
+                if m > 1 or not np.any(lx[m] != 0):
+                    continue
+                idx = np.array([0])
             Hm = H[idx]
             if m == 0:      # exact sum w kappa J0 minus what the lattice centres give
                 lres = lx[0] - (kmc[idx // ngc][:, None] * Hm).sum(axis=0)
@@ -1240,7 +1517,10 @@ class Cells:
             if not keep.any():
                 continue
             rows = (A @ V_desc[:, keep]).T                 # (r, nidx + 1)
-            self.xi_groups.append(dict(shell=shell, m=m, idx=idx, rows=rows))
+            grp = dict(shell=shell, m=m, idx=idx, rows=rows)
+            if m == 0 and "Wb" in cur:     # positive closure: bin rates + leading k_perp profile
+                grp.update(W=cur["Wb"][idx].copy(), v0=V_desc[:, 0].copy())
+            self.xi_groups.append(grp)
 
     def add_weak(self, m, v, shell, beta):
         if self.xi is not None:
@@ -1271,7 +1551,9 @@ def build_population(cos, zs, ell=True, fils=True, nord=3, nphi=12, nx=260,
     trunc="rvir" (with kap_floor): every NFW halo is truncated at its virial
     radius (sharp 3D cut, nfw_trunc_kg) and integrated out to where its
     point-mass shear tail falls to kap_floor; the clustering lattice's mean
-    is then made exact per shell (_fix_coarse_mean).
+    is then made exact per shell (_fix_coarse_mean).  trunc="r200" (2026-10-12):
+    the same, cut at r200c instead (x_t = c, no Delta_vir); a number f gives
+    r_t = f r_vir.
 
     nproc > 1: shells in a process pool (_build_targets); the result does not
     depend on nproc (2026-10-03).
@@ -1334,10 +1616,10 @@ class _ShellFanout:
         self.c = [Cells(1, nord, xi) for _ in self.r]
         self.kbar = [0.0] * len(self.r)
 
-    def add(self, K, G, W, shell, beta, R=None, tang=True):
+    def add(self, K, G, W, shell, beta, R=None, tang=True, xi_linear=False):
         for t, r in enumerate(self.r):
             Kt, Gt = (K, G) if r == 1.0 else (r * K, r * G)
-            self.c[t].add(Kt, Gt, W, 0, beta, R=R, tang=tang)
+            self.c[t].add(Kt, Gt, W, 0, beta, R=R, tang=tang, xi_linear=xi_linear)
             self.kbar[t] += float(np.sum(W * Kt))
 
     def xi_begin(self, dchi):
@@ -1408,6 +1690,13 @@ def _shell_pieces(ctx, i):
                         lin={b: v for (_, b), v in c.lin.items()}, kbar=kb,
                         N_expl=info["N_expl"], N_fil=info["N_fil"], V_weak=r * r * info["V_weak"],
                         xi_groups=c.xi_groups))
+    if xi is not None and xi.get("pos"):
+        # positive closure: geometry (z, chi, dchi) of the shell's first Limber node
+        jn, _, dz = nodes[0]
+        dzn = dz if dz is not None else ctx["zl_all"][jn] - ctx["zl_all"][jn - 1]
+        zn = ctx["zl_all"][jn]
+        for o in out:
+            o["node"] = (float(zn), float(cos.chi(zn)), float(CKMS / cos.Hz(zn) * dzn))
     return out
 
 
@@ -1425,6 +1714,7 @@ def _init_build_worker(cos_kw, zs_ref, targets, nord, ell, fils, nphi, nx, kthr,
 
 def _shell_worker(i):
     return _shell_pieces(_WCTX, i)
+
 
 
 def _build_targets(cos, targets, ell, fils, nord, nphi, nx, kthr, subhalo, nproc,
@@ -1507,6 +1797,9 @@ def _build_targets(cos, targets, ell, fils, nord, nphi, nx, kthr, subhalo, nproc
                 cells.lin[(i, b)] = cells.lin.get((i, b), 0.0) + v
             for g in pc.get("xi_groups", ()):
                 cells.xi_groups.append({**g, "shell": i})
+            if "node" in pc and targets[pc["t"]] == zs_ref:   # positive closure: per-shell cells
+                cells.__dict__.setdefault("pos_pieces", {})[i] = dict(
+                    idx=pc["idx"], h0=pc["h0"], h0k=pc["h0k"], h0g=pc["h0g"], node=pc["node"])
             for k in ("N_expl", "N_fil", "V_weak", "kbar"):
                 info[k] += pc[k]
     if trunc is not None:
@@ -1532,6 +1825,26 @@ def _fix_coarse_mean(cells):
             cells.wM[i, n] -= cells.Hc[i, n].sum(axis=1) @ kmc
 
 
+def _fil_phi_rule(n, rc=0.1):
+    """Filament orientation quadrature on uniform phi in [0, pi/2] (2026-10-16, resolution study).
+    The filament kappa amplitude k0 ~ 1 / max(rc, |cos phi|) has a kink at phi_c = acos(rc)
+    (rc = 2 rsF / LF = 0.1 for every filament, LF = 20 rsF). The old midpoint rule on the halos'
+    nphi nodes converged non-monotonically (nphi 12: 0.1-0.25% in variance, 0.3% in skew; 64:
+    0.06%). Here: n Gauss-Legendre nodes on [0, phi_c] (k0 analytic) + ONE node carrying the exact
+    clamped measure (pi/2 - phi_c)/(pi/2) (k0 constant there): ~1e-5 at n = 12, independent of the
+    halo nphi. Returns (phis, weights), sum(weights) = 1."""
+    pc = np.arccos(rc)
+    x, w = np.polynomial.legendre.leggauss(n)
+    ph = 0.5 * pc * (x + 1)
+    wt = 0.5 * pc * w / (0.5 * pi)
+    return (np.concatenate([ph, [0.5 * (pc + 0.5 * pi)]]),
+            np.concatenate([wt, [(0.5 * pi - pc) / (0.5 * pi)]]))
+
+
+FIL_PHI_N = 12
+FIL_PHI_RULE = _fil_phi_rule(FIL_PHI_N)
+
+
 def _build_shell_into(cells, info, cos, zs, i, jz, ell, fils, nphi, nx, kthr,
                       subhalo, zl_all, Ml, dlnM, phis, kap_floor=None, trunc=None,
                       ks_ratios=(), dz=None):
@@ -1547,8 +1860,12 @@ def _build_shell_into(cells, info, cos, zs, i, jz, ell, fils, nphi, nx, kthr,
     wz = CKMS / cos.Hz(z) * dz * pi * (1 + z)**2    # x rmax^2 x dn x dlnM
     D = Dg(cos, z)
     Scr = cos.Sigma_cr(z, zs)
+    mbox = _box_mmax(cos, z, Ml, dlnM) if BOX_HMPC > 0 else np.inf
     for jM in range(1, NM_ENG):
         M = Ml[jM]
+        # diagnostic cuts only (SGL_MMAX / SGL_MMIN / SGL_BOX); all off by default
+        if M > MMAX_CUT or M < MMIN_CUT or M > mbox:
+            continue
         dn = cos.dndlnM(M, z) * dlnM[jM - 1]
         C_, rs, ks, fC = cos.nfw_params(M, z, zs)
         bh = D * halo_bias(cos, M, z)
@@ -1556,8 +1873,13 @@ def _build_shell_into(cells, info, cos, zs, i, jz, ell, fils, nphi, nx, kthr,
         xt_ = None
         if nosplit and trunc is not None:
             from . import subhalos as _sh
-            ft = 1.0 if trunc == "rvir" else float(trunc)  # r_t = ft * r_vir
-            xt_ = ft * _sh._eta(cos, C_, z) * C_            # r_t / r_s
+            if trunc == "r200":
+                # 2026-10-12 (user, review R1): r_t = r200c, i.e. x_t = c; the
+                # halo encloses exactly the mass-function M, no Delta_vir
+                xt_ = C_
+            else:
+                ft = 1.0 if trunc == "rvir" else float(trunc)  # r_t = ft * r_vir
+                xt_ = ft * _sh._eta(cos, C_, z) * C_            # r_t / r_s
             g_xt = ks * 4 * (log(1 + xt_) - xt_ / (1 + xt_)) / xt_**2
             xm = xt_ * sqrt(g_xt / kap_floor) if g_xt > kap_floor else xt_
         else:
@@ -1672,13 +1994,14 @@ def _build_shell_into(cells, info, cos, zs, i, jz, ell, fils, nphi, nx, kthr,
                 ue = np.concatenate([[0.0], uF * np.geomspace(1e-5, 1.0, 120)])
                 uc = np.where(ue[:-1] > 0, sqrt(ue[:-1] * ue[1:]), 0.5 * ue[1])
                 fa = (ue[1:]**2 - ue[:-1]**2) / uF**2
-                k0 = k0base / np.maximum(2 * rsF, np.abs(np.cos(phis)) * LF)
+                # kink-split orientation rule (2026-10-16): see _fil_phi_rule
+                k0 = k0base / np.maximum(2 * rsF, np.abs(np.cos(FIL_PHI_RULE[0])) * LF)
                 K, G = fil.kappa_gamma_cyl(uc[:, None], k0[None, :])
-                W = NF * fa[:, None] / nphi * np.ones_like(K)
+                W = NF * fa[:, None] * FIL_PHI_RULE[1][None, :] * np.ones_like(K)
                 bf = D * fil_bias(cos, M, z)
                 if _xi_on(cells):       # filament axis not tangential: m = 0 only
-                    cells.add(K, G, W, i, bf, R=(uc[:, None] * (rsF * (1 + z)) * np.ones_like(K)).ravel(),
-                              tang=False)
+                    cells.add(K, G, W, i, bf if XI_FIL else 0.0, R=(uc[:, None] * (rsF * (1 + z)) * np.ones_like(K)).ravel(),
+                              tang=False, xi_linear=XI_LINEAR_FIL)
                 else:
                     cells.add(K, G, W, i, bf)
                 info["kbar"] += float(np.sum(W * K))
@@ -1690,6 +2013,13 @@ def _xi_on(cells):
     if isinstance(cells, _ShellFanout):
         return bool(cells.c) and cells.c[0].xi is not None
     return getattr(cells, "xi", None) is not None
+
+
+def _xi_linear_m(cells):
+    """Split mass of the faint-lens linearisation of Psi_2 (2026-10-13): the build
+    parameter xi["linear_M"] (run(..., xi_linear_m=)), else env SGL_XI_LINEAR_M."""
+    xi = cells.c[0].xi if isinstance(cells, _ShellFanout) else cells.xi
+    return float(xi.get("linear_M", XI_LINEAR_M))
 
 
 def _truncated_host(cells, info, cos, i, jz, jM, M, z, rs, ks, xt, xm, wz, dn, bh,
@@ -1798,9 +2128,10 @@ def _truncated_host(cells, info, cos, i, jz, jM, M, z, rs, ks, xt, xm, wz, dn, b
         R = np.concatenate([Xi, Xo]) * (rs * (1 + z))          # comoving [Mpc]
         if R.size != K.size:
             raise RuntimeError("xi: lens distances do not match the emitted points")
-        cells.add(K, G, W, i, bh, R=R, tang=True)
+        bh_xi = bh if XI_MMIN <= M < XI_MMAX else 0.0
+        cells.add(K, G, W, i, bh_xi, R=R, tang=True, xi_linear=bool(M < _xi_linear_m(cells)))
         Rm = xm * rs * (1 + z)
-        cells.xi_add_shear_tail(bh, ks * 4 * (log(1 + xt) - xt / (1 + xt)) * (rs * (1 + z))**2,
+        cells.xi_add_shear_tail(bh_xi, ks * 4 * (log(1 + xt) - xt / (1 + xt)) * (rs * (1 + z))**2,
                                 Rm, Nbar / (pi * Rm**2))
     else:
         cells.add(K, G, W, i, bh)
@@ -2330,6 +2661,24 @@ def _sep_gamma_nodes(g0, w, ig, eg, kg_max, theta, mg, smax):
     return nodes.ravel(), wl, cols, direct
 
 
+
+def _cheb_lobatto_matrix(K, N, x):
+    """Chebyshev-Lobatto points t_j on [0, K] (N) and the barycentric interpolation matrix
+    L (len(x), N) with f(x) ~ L f(t) (2026-10-16, for Lam._sep_raw). Points of x that coincide
+    with a node (x = 0, x = K) get the exact unit row."""
+    j = np.arange(N)
+    t = 0.5 * K * (1.0 - np.cos(j * pi / (N - 1)))
+    w = (-1.0) ** j
+    w[0] *= 0.5
+    w[-1] *= 0.5
+    d = x[:, None] - t[None, :]
+    exact = np.abs(d) <= 1e-14 * K
+    L = w[None, :] / np.where(exact, 1.0, d)
+    L /= L.sum(axis=1, keepdims=True)
+    hit = exact.any(axis=1)
+    L[hit] = exact[hit].astype(float)
+    return t, L
+
 def _lam_worker_block(payload):
     """Worker evaluating one block of kg columns for Lam._direct_call."""
     k0, g0, w, kk, kg_sub, kg_block = payload
@@ -2380,7 +2729,11 @@ class Lam:
                  nsamp=2_000_000, seed=0, centroid=True, s_taper="cos2",
                  s_is=True, is_alpha=0.5, is_levels=(0.1, 0.4, 1.0),
                  q_coarse=101, lss_var=0.0, lam_coarse=0, lam_method="sep", xi=False,
-                 xi_coarse=51, xi_prune=1e-7):
+                 xi_coarse=101, xi_prune=1e-7, xi_clamp=False):
+        # xi_clamp (2026-10-13, user/option 1B): clamp Re(Psi_2) <= 0 to prevent
+        # the unphysical high-k revival where F_1 F_2 -> +1 from cancelling Psi_1.
+        # Default OFF since 2026-10-13 (user): see run_full_chain.py --xi_clamp.
+        self.xi_clamp = bool(xi_clamp)
         # lss_var (2026-10-02): variance of a Gaussian large-scale-structure
         # convergence (limber_lss_var), with the same total shear variance:
         # adds -1/2 lss_var (k_kap^2 + k_gam^2 / 2) to ln Phi.  0 = off.
@@ -2508,6 +2861,12 @@ class Lam:
                                             sign=1.0 if m == 0 else 2.0 * (-1)**m)
 
     def _Qxi(self, kk, kg):
+        pos = self.__dict__.get("pos")
+        if pos is not None:             # positive Cox closure (pos_closure.install)
+            return pos.qxi(kk, kg)
+        return self._Qxi_gauss(kk, kg)
+
+    def _Qxi_gauss(self, kk, kg):
         """xi_lin two-point term (2026-10-05), see xi_kperp_grid:
           sum_groups sign_m / 2 sum_r G_r^2,
           G_r = sum_b rows_rb f_m(b) + res_r f_res,
@@ -2525,6 +2884,8 @@ class Lam:
             G += 1j * kk[:, None] * self._res0_all[None, :]
             out = np.zeros((kk.size, 1), complex)
             out[:, 0] = 0.5 * np.sum(G * G, axis=1)
+            if self.xi_clamp:
+                out = np.minimum(out.real, 0.0) + 1j * out.imag
             return out
 
         # 1D reach along gamma (k_kappa = 0: phase is identically 1)
@@ -2545,12 +2906,18 @@ class Lam:
                 elif m == 1:
                     G += 0.5 * kg[None, :] * d["res"][:, None]
                 out[0, :] += 0.5 * d["sign"] * np.sum(G * G, axis=0)
+            if self.xi_clamp:
+                out = np.minimum(out.real, 0.0) + 1j * out.imag
             return out
 
         # General 2D grid evaluation (coarse grid)
         import scipy.special as sp
         ph_all = np.outer(kk, self._kmc)
-        Er_all, Ei_all = np.cos(ph_all), np.sin(ph_all)
+        # [cos; sin] stacked (2026-10-16): the E-products of a group are ONE GEMM
+        # (2 nk x nP) @ (nP x r nkg) instead of 2 r small stacked matmuls (numpy
+        # loops BLAS per batch, 62 GF/s). Same dot products -> bit-identical Q;
+        # 2.1-2.6x faster at 101^2 (tmp/perf/qxi_blocks.py).
+        Ecat_all = np.concatenate([np.cos(ph_all), np.sin(ph_all)], axis=0)
         xg_all = np.outer(self._gmc, kg)
         max_m = max(g["m"] for g in self._xg)
         J_tables = {0: sp.j0(xg_all)}
@@ -2567,21 +2934,23 @@ class Lam:
             Hd[:, g["pinv"], g["qinv"]] = g["rows"]
             Jm = J_tables[m][g["idx_q"], :]
             T = (Hd.reshape(r * nP, nQ) @ Jm).reshape(r, nP, kg.size)
-            Er = Er_all[:, g["idx_p"]]
-            Ei = Ei_all[:, g["idx_p"]]
-            Gr = np.matmul(Er, T)
-            Gi = np.matmul(Ei, T)
+            T2 = np.ascontiguousarray(T.transpose(1, 0, 2)).reshape(nP, r * kg.size)
+            G = (Ecat_all[:, g["idx_p"]] @ T2).reshape(2, kk.size, r, kg.size)
+            Gr = G[0].transpose(1, 0, 2)                     # (r, nk, nkg) views
+            Gi = G[1].transpose(1, 0, 2)
             if m == 0:
-                Gr -= g["sum_rows"][:, None, None]
-                Gi += kk[None, :, None] * g["res"][:, None, None]
+                Gr = Gr - g["sum_rows"][:, None, None]
+                Gi = Gi + kk[None, :, None] * g["res"][:, None, None]
             elif m == 1:
-                Gr += 0.5 * kg[None, None, :] * g["res"][:, None, None]
+                Gr = Gr + 0.5 * kg[None, None, :] * g["res"][:, None, None]
             re = np.sum(Gr**2 - Gi**2, axis=0)
             im = 2.0 * np.sum(Gr * Gi, axis=0)
             out += (0.5 * g["sign"]) * (re + 1j * im)
+        if self.xi_clamp:
+            out = np.minimum(out.real, 0.0) + 1j * out.imag
         return out
 
-    def _Q_interpolated(self, kk, kg, fn=None, n=None):
+    def _Q_interpolated(self, kk, kg, fn=None, n=None, nk=None):
         """Coarse-grid evaluation + 2D cubic spline interpolation of Q(k_k, k_g).
         Evaluates Q on a nested coarse grid (k = kmax s^2, uniform in s), then
         interpolates with bicubic splines in s = sqrt(k / kmax).
@@ -2590,17 +2959,46 @@ class Lam:
         un-interpolated moments to ~2e-5 relative in variance and ~4e-4 in skew.
         """
         n = self.q_coarse if n is None else int(n)
-        kk_max, kg_max = float(kk[-1]), float(kg[-1])
+        # nk (2026-10-19): separate node count along k_kappa (default = n, bit-identical); the positive
+        # closures' ln R has structure on Delta(k sigma) ~ 1 along k_kappa (coarse kappa bins) that a
+        # square grid cannot follow when the box is long (low z_s floor cases)
+        nk = n if nk is None else int(nk)
+        # blocked inversion (2026-10-16): invert sets self._ext = (k_k_max, k_g_max) and
+        # calls Lam on k_kappa row blocks; the coarse grid must span the GLOBAL extent
+        # and is built ONCE (cache), so each block gets exactly the unblocked rows.
+        ext = getattr(self, "_ext", None)
+        if ext is not None:
+            kk_max, kg_max = float(ext[0]), float(ext[1])
+        else:
+            kk_max, kg_max = float(kk[-1]), float(kg[-1])
         s = np.linspace(0.0, 1.0, n)
-        kk_c = kk_max * s**2
-        kg_c = kg_max * s**2
-        Q_c = (self.Q if fn is None else fn)(kk_c, kg_c)
+        s_k = s if nk == n else np.linspace(0.0, 1.0, nk)
         sk = np.sqrt(np.clip(kk / kk_max, 0.0, 1.0))
         sg = np.sqrt(np.clip(kg / kg_max, 0.0, 1.0))
+        if ext is not None and self.q_spline != "rgi":
+            from scipy.interpolate import make_interp_spline, BSpline
+            key = (getattr(fn, "__name__", "Q"), n, nk, kk_max, kg_max, kg.size, float(kg[-1]))
+            cache = self.__dict__.setdefault("_qcache", {})
+            if key not in cache:
+                Q_c = (self.Q if fn is None else fn)(kk_max * s_k**2, kg_max * s**2)
+                parts = []
+                for part in (Q_c.real, Q_c.imag):
+                    sp0 = make_interp_spline(s_k, part, k=3, axis=0)
+                    sp1 = make_interp_spline(s, sp0.c, k=3, axis=1)
+                    parts.append((sp0.t, (BSpline.design_matrix(sg, sp1.t, 3) @ sp1.c).T))
+                cache[key] = parts
+            (t_re, G_re), (t_im, G_im) = cache[key]
+            Q_out = np.empty((kk.size, kg.size), complex)
+            Q_out.real = BSpline.design_matrix(sk, t_re, 3) @ G_re
+            Q_out.imag = BSpline.design_matrix(sk, t_im, 3) @ G_im
+            return Q_out
+        kk_c = kk_max * s_k**2
+        kg_c = kg_max * s**2
+        Q_c = (self.Q if fn is None else fn)(kk_c, kg_c)
         if self.q_spline == "rgi":          # pre-2026-10-06 path, kept for A/B
             from scipy.interpolate import RegularGridInterpolator
-            re_ip = RegularGridInterpolator((s, s), Q_c.real, method="cubic")
-            im_ip = RegularGridInterpolator((s, s), Q_c.imag, method="cubic")
+            re_ip = RegularGridInterpolator((s_k, s), Q_c.real, method="cubic")
+            im_ip = RegularGridInterpolator((s_k, s), Q_c.imag, method="cubic")
             Q_out = np.empty((kk.size, kg.size), complex)
             for lo in range(0, sk.size, 128):
                 hi = min(lo + 128, sk.size)
@@ -2617,7 +3015,7 @@ class Lam:
         from scipy.interpolate import make_interp_spline, BSpline
         Q_out = np.empty((kk.size, kg.size), complex)
         for part, setter in ((Q_c.real, "real"), (Q_c.imag, "imag")):
-            sp0 = make_interp_spline(s, part, k=3, axis=0)
+            sp0 = make_interp_spline(s_k, part, k=3, axis=0)
             sp1 = make_interp_spline(s, sp0.c, k=3, axis=1)     # c is (nb_g, nb_k)
             val = BSpline.design_matrix(sk, sp0.t, 3) @ (BSpline.design_matrix(sg, sp1.t, 3) @ sp1.c).T
             setattr(Q_out, setter, val)
@@ -2636,6 +3034,7 @@ class Lam:
     # the direct sum's own roundoff).  Small calls (the _reach probes) stay
     # direct, so the adaptive k-grid is chosen exactly as before.
     SEP_THETA, SEP_MG, SEP_SMAX = 0.5, 8, 64
+    SEP_CHEB = True        # Chebyshev k_gamma factor in _sep_raw (2026-10-16); False = old exact-grid GEMM
     SEP_MIN_POINTS = 200_000
 
     def _sep_raw(self, kk, kg):
@@ -2655,13 +3054,35 @@ class Lam:
         nodes, wl, cols, direct = st
         A1, Tr, Ti = _sep_lam_kernel(np.ascontiguousarray(kk, dtype=float), self.k0,
                                      self.w0, wl, cols, nodes.size)
-        Bn = _j0m1(np.outer(nodes, kg))
-        out = Tr @ Bn + 1j * (Ti @ Bn)
+        # Chebyshev k_gamma factor (2026-10-16): J0(kg gam_node) - 1 is band-limited by
+        # gam_max * kg_max, so the GEMM is done on N Chebyshev-Lobatto k_gamma points and
+        # interpolated (barycentric) onto the grid. N = 0.65 bw + 50 reproduces the table
+        # to 8e-15 (bw ~ 800: N ~ 570 vs 2687-3359 grid columns -> GEMM 5-6x cheaper).
+        # Roundoff-level change (not bit-identical); tmp/perf/sep_split.py.
+        Kg = float(kg[-1]) if kg.size else 0.0
+        Nch = int(0.65 * float(nodes.max()) * Kg + 50) if (nodes.size and Kg > 0) else 0
+        if self.SEP_CHEB and kg.size > 1 and 0 < Nch < 0.6 * kg.size and kg[0] >= 0.0:
+            tch, Lch = _cheb_lobatto_matrix(Kg, Nch, kg)
+            Bc = _j0m1(np.outer(nodes, tch))
+            out = (Tr @ Bc) @ Lch.T + 1j * ((Ti @ Bc) @ Lch.T)
+        else:
+            Bn = _j0m1(np.outer(nodes, kg))
+            out = Tr @ Bn + 1j * (Ti @ Bn)
         del Tr, Ti
         out += A1[:, None]
         if direct.any():
-            E = np.exp(1j * np.outer(kk, self.k0[direct])) * self.w0[direct]
-            out += E @ _j0m1(np.outer(self.g0[direct], kg))
+            if os.environ.get("SGL_DIRECT_PRODUCT", "fast") == "original":
+                # (2026-10-20) the exact pre-speedup expression: bit-identical to every output computed before
+                # the Accelerate direct product (aggr2p_verify integrity reruns need this; the fast path moves
+                # Gaussian PDFs at roundoff level, 3648: 2.6e-9 of peak)
+                E = np.exp(1j * np.outer(kk, self.k0[direct])) * self.w0[direct]
+                out += E @ _j0m1(np.outer(self.g0[direct], kg))
+            else:
+                if not hasattr(self, "_direct_product_evaluator"):
+                    from .sgl_direct import DirectProduct
+                    self._direct_product_evaluator = DirectProduct()
+                out += self._direct_product_evaluator(kk, kg, self.k0[direct],
+                                                      self.g0[direct], self.w0[direct])
         return out
 
     def _direct_call(self, kk, kg, nproc=1):
@@ -2682,19 +3103,29 @@ class Lam:
         out -= 0.5 * np.outer(kk**2 * self.V, np.ones(kg.size))
         if self.lss_var:
             out -= 0.5 * self.lss_var * (kk[:, None]**2 + 0.5 * kg[None, :]**2)
+        blocked = getattr(self, "_ext", None) is not None
         if self.C is not None:
-            if self.q_coarse and (kk.size * kg.size > self.q_coarse**2) and kk.size > 1 and kg.size > 1 and kk[-1] > 0 and kg[-1] > 0:
+            if self.q_coarse and (blocked or ((kk.size * kg.size > self.q_coarse**2) and kk.size > 1 and kg.size > 1 and kk[-1] > 0 and kg[-1] > 0)):
                 out += self._Q_interpolated(kk, kg)
             else:
                 out += self.Q(kk, kg)
         if self.xi_on:
             # own coarse grid (2026-10-05): 51^2 vs 101^2 moves the z_s=10 PDF
-            # by 3.6e-8 of peak (the two-halo term is smooth), invert 4.3 -> 1.4 s
+            # by 3.6e-8 of peak (the two-halo term is smooth), invert 4.3 -> 1.4 s.
+            # DEFAULT 51 -> 101 (2026-10-16, user): at 51^2 the interpolation made the
+            # Planck z_s=0.5 tail NEGATIVE beyond ln mu ~1.8 (neg mass 2.2e-7; positive
+            # at 101^2/151^2, which agree to 0.4% at ln mu=2) and the z_s=1 lower edge
+            # min/peak -6.7e-6 (-> -9.9e-8). z_s>=1 bodies/moments move <= 1e-5;
+            # invert +1-1.6 s. experiments/psi2_positivity/clamp/{zs05_coarse,xi_check}.py
             nx_ = self.xi_coarse
-            if nx_ and (kk.size * kg.size > nx_**2) and kk.size > 1 and kg.size > 1 and kk[-1] > 0 and kg[-1] > 0:
-                out += self._Q_interpolated(kk, kg, fn=self._Qxi, n=nx_)
+            if nx_ and (blocked or ((kk.size * kg.size > nx_**2) and kk.size > 1 and kg.size > 1 and kk[-1] > 0 and kg[-1] > 0)):
+                qxi = self._Q_interpolated(kk, kg, fn=self._Qxi, n=nx_,
+                                           nk=(getattr(self, "xi_coarse_k", 0) or None))
             else:
-                out += self._Qxi(kk, kg)
+                qxi = self._Qxi(kk, kg)
+            if self.xi_clamp:
+                qxi = np.minimum(qxi.real, 0.0) + 1j * qxi.imag
+            out += qxi
         if self.exactS:
             out += self.S_correction(kk)[:, None]
         return out
