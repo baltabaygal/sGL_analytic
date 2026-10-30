@@ -289,6 +289,32 @@ package (`scripts/make_references.py`), and this package reproduces them bit for
 bit (max|dP| = 0). After a sync, regenerate them, carry any new `run()` defaults
 over to `pipeline.py` by hand, and rerun both reference regressions.
 
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@article{Baltabay:2026nmz,
+    author = "Baltabay, Galymzhan and Vaskonen, Ville",
+    title = "{FLUMEN: Neural Emulator of an Advanced Stochastic Weak Lensing Model}",
+    eprint = "2609.21806",
+    archivePrefix = "arXiv",
+    primaryClass = "astro-ph.CO",
+    month = "9",
+    year = "2026"
+}
+
+@misc{Baltabay2026cos,
+      title={Cosmological lensing as a jump process},
+      author={Galymzhan Baltabay and Ville Vaskonen},
+      year={2026},
+      eprint={2610.40341},
+      archivePrefix={arXiv},
+      primaryClass={astro-ph.CO},
+      url={https://arxiv.org/abs/2610.40341},
+}
+```
+
 ## Changes in 0.2.0
 
 The defaults follow the research repository's chain as of 2026-10-21:
