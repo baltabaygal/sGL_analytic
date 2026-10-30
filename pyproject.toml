@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "sgl-analytic"
 version = "0.2.0"
 description = "Sampling-free stochastic weak-lensing magnification PDFs"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = ["numpy>=2.0,<3", "scipy>=1.13,<2", "numba>=0.61,<1"]
 
